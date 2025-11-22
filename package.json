@@ -6,7 +6,7 @@
   "author": "Pravin",
   "license": "MIT",
   "scripts": {
-    "dev:renderer": "vite --config renderer/vite.config.js --cwd renderer",
+    "dev:renderer": "cd renderer && vite",
     "dev:main": "electronmon .",
     "dev": "concurrently \"npm:dev:renderer\" \"npm:dev:main\"",
     "start": "electron .",
@@ -39,7 +39,10 @@
       "package.json"
     ],
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "category": "Video"
     }
   }
