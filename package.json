@@ -1,0 +1,46 @@
+{
+  "name": "slab-tv",
+  "version": "0.1.0",
+  "description": "Slab TV — Electron + React + Vite + PWA remote for Ubuntu Linux (X11)",
+  "main": "main.js",
+  "author": "Pravin",
+  "license": "MIT",
+  "scripts": {
+    "dev:renderer": "vite --config renderer/vite.config.js --cwd renderer",
+    "dev:main": "electronmon .",
+    "dev": "concurrently \"npm:dev:renderer\" \"npm:dev:main\"",
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:renderer": "vite build --config renderer/vite.config.js --cwd renderer"
+  },
+  "dependencies": {
+    "better-sqlite3": "^8.0.0",
+    "bonjour": "^3.5.0",
+    "express": "^4.18.2",
+    "qrcode": "^1.5.0",
+    "ws": "^8.13.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1",
+    "electronmon": "^2.0.1",
+    "vite": "^5.0.0"
+  },
+  "build": {
+    "appId": "com.pravin.slabtv",
+    "productName": "SlabTV",
+    "files": [
+      "main.js",
+      "preload.js",
+      "nativeHelpers.js",
+      "renderer/**/*",
+      "remote/**/*",
+      "package.json"
+    ],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Video"
+    }
+  }
+}
