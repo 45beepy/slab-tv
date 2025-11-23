@@ -50,7 +50,7 @@ function createWindow() {
     }
   });
 
-  mainWindow.loadFile("./renderer/index.html");
+  // NOTE: renderer content is loaded later (dev: via loadURL; prod: loadFile)
 }
 
 async function doLaunchSlab() {
@@ -68,14 +68,22 @@ async function doLaunchSlab() {
         mainWindow.setBounds({ x, y, width, height });
         // small delay then fullscreen
         setTimeout(() => {
-          mainWindow.setFullScreen(true);
-          mainWindow.focus();
+          try {
+            mainWindow.setFullScreen(true);
+            mainWindow.focus();
+          } catch (e) {
+            console.error("setFullScreen error", e);
+          }
         }, 200);
         return { ok: true, display: displays[1] };
       }
     } else {
-      mainWindow.setFullScreen(true);
-      mainWindow.focus();
+      try {
+        mainWindow.setFullScreen(true);
+        mainWindow.focus();
+      } catch (e) {
+        console.error("setFullScreen fallback error", e);
+      }
       return { ok: true, display: null };
     }
   } catch (e) {
@@ -182,7 +190,11 @@ function startRemoteServer() {
 
   wsServer = wss;
 
-  bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: "slabtv", port: REMOTE_PORT });
+  try {
+    bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: "slabtv", port: REMOTE_PORT });
+  } catch (e) {
+    console.warn("mDNS advertise failed (bonjour)", e);
+  }
 }
 
 // --- display polling ---
@@ -227,15 +239,83 @@ ipcMain.handle("launch-app", async (evt, appId, args) => {
   return await doLaunchApp(appId, args);
 });
 
-// app lifecycle
-app.whenReady().then(() => {
-  createWindow();
-  startRemoteServer();
-  startDisplayPolling(1500);
+// Helper: wait for a URL to be responsive (used to wait for Vite dev server)
+async function waitForUrl(url, timeout = 20000, interval = 200) {
+  const start = Date.now();
 
+  while (Date.now() - start < timeout) {
+    try {
+      await new Promise((resolve, reject) => {
+        const req = http.get(url, (res) => {
+          // any response means server is up
+          res.destroy();
+          resolve();
+        });
+        req.on("error", reject);
+      });
+      return true;
+    } catch (e) {
+      await new Promise(r => setTimeout(r, interval));
+    }
+  }
+  return false;
+}
+
+// app lifecycle and startup
+app.whenReady().then(async () => {
+  createWindow();
+
+  // start remote server early so API is available
+  try {
+    startRemoteServer();
+  } catch (e) {
+    console.error("startRemoteServer error", e);
+  }
+
+  // dev vs prod: load renderer appropriately
+  const devUrl = process.env.VITE_DEV_URL || "http://localhost:5174"; // allow override via env
+  if (process.env.NODE_ENV !== "production") {
+    try {
+      const up = await waitForUrl(devUrl, 20000, 200);
+      if (up) {
+        mainWindow.loadURL(devUrl);
+      } else {
+        console.warn("Dev server not responding, falling back to local file");
+        mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+      }
+    } catch (e) {
+      console.error("URL wait error", e);
+      mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+    }
+  } else {
+    mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+  }
+
+  // start display polling after window exists
+  try {
+    startDisplayPolling(1500);
+  } catch (e) {
+    console.error("startDisplayPolling err", e);
+  }
+
+  // macOS activation behavior
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
-app.on("window-all-closed", () => app.quit());
+// ensure graceful quit
+app.on("window-all-closed", () => {
+  try {
+    if (process.platform !== "darwin") {
+      // close websocket server if running
+      if (wsServer && wsServer.close) {
+        try { wsServer.close(); } catch (e) { /* ignore */ }
+      }
+      app.quit();
+    }
+  } catch (e) {
+    console.error("window-all-closed handler err", e);
+    app.quit();
+  }
+});
