@@ -1,5 +1,12 @@
 // main.js
-const { app, BrowserWindow, ipcMain } = require("electron");
+// Complete main process for Slab TV (development-friendly)
+// - Dev: waits for Vite and loads dev URL
+// - Remote: Express + WebSocket server with pairing QR
+// - Display polling (xrandr wrapper in nativeHelpers)
+// - BrowserView-based Slab mode (embed web apps inside Electron window)
+// - IPC handlers for renderer <-> main (launch-slab, exit-slab, open-url-in-view, launch-app, config)
+
+const { app, BrowserWindow, ipcMain, BrowserView } = require("electron");
 const path = require("path");
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -13,13 +20,18 @@ const { spawn } = require("child_process");
 const { detectDisplays, moveWindowToDisplay, launchApp } = require("./nativeHelpers");
 
 const REMOTE_PORT = 3000;
-const CONFIG_PATH = path.join(app ? app.getPath('userData') : __dirname, "slab-config.json"); // persists per user
+const CONFIG_PATH = path.join(app ? app.getPath("userData") : __dirname, "slab-config.json");
 
-let mainWindow;
-let wsServer;
+let mainWindow = null;
+let wsServer = null;
 let lastDisplaysJson = "[]";
 
-// --- Config helpers ---
+// BrowserView / Slab-mode state
+let activeView = null;
+let previousBounds = null;
+let isInSlabMode = false;
+
+// --------------------- Config helpers ---------------------
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_PATH)) {
@@ -39,53 +51,105 @@ function saveConfig(cfg) {
   }
 }
 
-// --- Core window / actions ---
+// --------------------- Window creation ---------------------
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 720,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true
+      contextIsolation: true,
+      nodeIntegration: false
     }
   });
 
-  // NOTE: renderer content is loaded later (dev: via loadURL; prod: loadFile)
+  // We'll load renderer content later (dev: loadURL; prod: loadFile).
 }
 
-async function doLaunchSlab() {
-  // Attempt to move main window to the external display and make fullscreen
+// --------------------- BrowserView helpers ---------------------
+async function openUrlInBrowserView(url) {
   try {
-    const displays = await detectDisplays();
-    if (displays.length > 1 && displays[1] && displays[1].geometry) {
-      const geo = displays[1].geometry;
-      const match = geo.match(/(\d+)x(\d+)\+(\d+)\+(\d+)/);
-      if (match) {
-        const width = parseInt(match[1], 10);
-        const height = parseInt(match[2], 10);
-        const x = parseInt(match[3], 10);
-        const y = parseInt(match[4], 10);
-        mainWindow.setBounds({ x, y, width, height });
-        // small delay then fullscreen
-        setTimeout(() => {
-          try {
-            mainWindow.setFullScreen(true);
-            mainWindow.focus();
-          } catch (e) {
-            console.error("setFullScreen error", e);
-          }
-        }, 200);
-        return { ok: true, display: displays[1] };
-      }
-    } else {
+    // remove existing view
+    if (activeView) {
       try {
-        mainWindow.setFullScreen(true);
-        mainWindow.focus();
-      } catch (e) {
-        console.error("setFullScreen fallback error", e);
-      }
-      return { ok: true, display: null };
+        mainWindow.removeBrowserView(activeView);
+        activeView.webContents.destroy();
+      } catch (e) { /* ignore */ }
+      activeView = null;
     }
+
+    previousBounds = mainWindow.getBounds();
+
+    activeView = new BrowserView({
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true
+      }
+    });
+
+    mainWindow.setBrowserView(activeView);
+
+    // fill the whole window (change if you want a top bar)
+    const [w, h] = mainWindow.getSize();
+    activeView.setBounds({ x: 0, y: 0, width: w, height: h });
+    activeView.setAutoResize({ width: true, height: true });
+
+    // load URL
+    await activeView.webContents.loadURL(url);
+
+    // focus so it can receive input
+    activeView.webContents.focus();
+
+    isInSlabMode = true;
+    if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("slab-state", { slab: true });
+
+    return { ok: true };
+  } catch (e) {
+    console.error("openUrlInBrowserView error", e);
+    return { ok: false, error: e.message };
+  }
+}
+
+async function exitSlab() {
+  try {
+    if (activeView) {
+      try {
+        mainWindow.removeBrowserView(activeView);
+        activeView.webContents.destroy();
+      } catch (e) { /* ignore */ }
+      activeView = null;
+    }
+
+    try { mainWindow.setFullScreen(false); } catch (e) {}
+    if (previousBounds) {
+      try { mainWindow.setBounds(previousBounds); } catch (e) {}
+      previousBounds = null;
+    }
+
+    isInSlabMode = false;
+    if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("slab-state", { slab: false });
+    return { ok: true };
+  } catch (e) {
+    console.error("exitSlab error", e);
+    return { ok: false, error: e.message };
+  }
+}
+
+// --------------------- App launching / embedded logic ---------------------
+async function doLaunchSlab() {
+  try {
+    const cfg = loadConfig();
+    const defaultApp = cfg.defaultApp || { appId: "chrome", args: ["--new-window"] };
+
+    // try to find a URL in args (simple heuristic)
+    const urlArg = (defaultApp.args || []).find(a => /^https?:\/\//i.test(a));
+    const urlToOpen = urlArg || "https://www.youtube.com/";
+
+    // Make the window fullscreen (so BrowserView will fill it)
+    try { mainWindow.setFullScreen(true); } catch (e) {}
+
+    return await openUrlInBrowserView(urlToOpen);
   } catch (e) {
     console.error("doLaunchSlab err", e);
     return { ok: false, error: e.message };
@@ -93,8 +157,8 @@ async function doLaunchSlab() {
 }
 
 async function doLaunchApp(appId, args = []) {
-  // map appId to actual command; expand later with config
   try {
+    // Fallback: for native apps, keep launching externally
     let cmd = null;
     let finalArgs = args || [];
     if (appId === "chrome") {
@@ -105,18 +169,16 @@ async function doLaunchApp(appId, args = []) {
     } else if (appId === "stremio") {
       cmd = "stremio";
     } else {
-      // fallback: try to run appId as command
       cmd = appId;
     }
 
     launchApp(cmd, finalArgs);
 
-    // attempt to move newly launched app to second display
+    // attempt best-effort move to external display (if any)
     setTimeout(async () => {
       try {
         const displays = await detectDisplays();
         if (displays.length > 1) {
-          // best-effort move, title heuristics
           if (appId === "chrome") await moveWindowToDisplay("Google Chrome", displays[1]);
           if (appId === "vlc") await moveWindowToDisplay("VLC media player", displays[1]);
         }
@@ -132,13 +194,12 @@ async function doLaunchApp(appId, args = []) {
   }
 }
 
-// --- Express / WebSocket server ---
+// --------------------- Remote server (Express + WebSocket) ---------------------
 function startRemoteServer() {
   const appServer = express();
   appServer.use(bodyParser.json());
   appServer.use(express.static("remote"));
 
-  // API: remotes can POST to trigger actions
   appServer.post("/api/launch-slab", async (req, res) => {
     const result = await doLaunchSlab();
     res.json(result);
@@ -152,7 +213,6 @@ function startRemoteServer() {
     res.json(result);
   });
 
-  // minimal status endpoint
   appServer.get("/api/status", (req, res) => {
     res.json({ ok: true, host: os.hostname() });
   });
@@ -166,12 +226,58 @@ function startRemoteServer() {
     socket.on("message", async msg => {
       try {
         const data = JSON.parse(msg);
+
+        // D-pad / navigation input forwarding
         if (data.type === "input" && data.sub === "dpad") {
-          const keyMap = { up: "Up", down: "Down", left: "Left", right: "Right", ok: "Return", back: "Escape" };
-          if (keyMap[data.dir]) spawn("xdotool", ["key", keyMap[data.dir]]);
+          const keyMap = { up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight", ok: "Enter", back: "Escape" };
+          const key = keyMap[data.dir];
+
+          if (activeView && activeView.webContents) {
+            try {
+              activeView.webContents.focus();
+              // send a down+up to emulate a press
+              activeView.webContents.sendInputEvent({ type: "keyDown", keyCode: key });
+              activeView.webContents.sendInputEvent({ type: "keyUp", keyCode: key });
+            } catch (e) {
+              console.error("sendInputEvent error", e);
+            }
+          } else {
+            // fallback to xdotool (system-level)
+            if (key) {
+              const fallback = key.replace("Arrow", ""); // ArrowUp -> Up
+              spawn("xdotool", ["key", fallback]);
+            }
+          }
+
+        } else if (data.type === "input" && data.sub === "text") {
+          // For text, send keystrokes to the view or fallback to xdotool
+          const text = data.text || "";
+          if (activeView && activeView.webContents) {
+            try {
+              // send each char (basic)
+              for (const ch of text) {
+                activeView.webContents.sendInputEvent({ type: "char", keyCode: ch });
+              }
+            } catch (e) { console.error("text input error", e); }
+          } else {
+            spawn("xdotool", ["type", text]);
+          }
+
         } else if (data.type === "command" && data.name === "launch_app") {
           const { appId, args } = data;
           await doLaunchApp(appId, args);
+
+        } else if (data.type === "command" && data.name === "open_url") {
+          const { url } = data;
+          if (url && activeView) {
+            try {
+              await activeView.webContents.loadURL(url);
+            } catch (e) { console.error("open_url error", e); }
+          } else if (url) {
+            // if not in view, launch slab mode using the URL
+            await openUrlInBrowserView(url);
+          }
+
         } else if (data.type === "pair_request") {
           const token = Math.random().toString(36).substring(2, 8);
           const uri = `slabtv://pair?token=${token}&host=${os.hostname()}:${REMOTE_PORT}`;
@@ -197,7 +303,7 @@ function startRemoteServer() {
   }
 }
 
-// --- display polling ---
+// --------------------- Display polling ---------------------
 async function startDisplayPolling(intervalMs = 1500) {
   try {
     const displays = await detectDisplays();
@@ -221,36 +327,34 @@ async function startDisplayPolling(intervalMs = 1500) {
   }, intervalMs);
 }
 
-// IPC handlers
+// --------------------- IPC handlers ---------------------
 ipcMain.handle("launch-slab", async () => {
   return await doLaunchSlab();
 });
-
+ipcMain.handle("exit-slab", async () => {
+  return await exitSlab();
+});
+ipcMain.handle("open-url-in-view", async (evt, url) => {
+  return await openUrlInBrowserView(url);
+});
 ipcMain.handle("get-config", async () => {
   return loadConfig();
 });
-
 ipcMain.handle("save-config", async (evt, cfg) => {
   saveConfig(cfg);
   return { ok: true };
 });
-
 ipcMain.handle("launch-app", async (evt, appId, args) => {
   return await doLaunchApp(appId, args);
 });
 
-// Helper: wait for a URL to be responsive (used to wait for Vite dev server)
+// --------------------- Helper: wait for URL ---------------------
 async function waitForUrl(url, timeout = 20000, interval = 200) {
   const start = Date.now();
-
   while (Date.now() - start < timeout) {
     try {
       await new Promise((resolve, reject) => {
-        const req = http.get(url, (res) => {
-          // any response means server is up
-          res.destroy();
-          resolve();
-        });
+        const req = http.get(url, res => { res.destroy(); resolve(); });
         req.on("error", reject);
       });
       return true;
@@ -261,19 +365,15 @@ async function waitForUrl(url, timeout = 20000, interval = 200) {
   return false;
 }
 
-// app lifecycle and startup
+// --------------------- App lifecycle ---------------------
 app.whenReady().then(async () => {
   createWindow();
 
-  // start remote server early so API is available
-  try {
-    startRemoteServer();
-  } catch (e) {
-    console.error("startRemoteServer error", e);
-  }
+  // start remote API early
+  try { startRemoteServer(); } catch (e) { console.error("startRemoteServer error", e); }
 
-  // dev vs prod: load renderer appropriately
-  const devUrl = process.env.VITE_DEV_URL || "http://localhost:5174"; // allow override via env
+  // load renderer (dev: loadURL once vite is ready; prod: load built files)
+  const devUrl = process.env.VITE_DEV_URL || "http://localhost:5174";
   if (process.env.NODE_ENV !== "production") {
     try {
       const up = await waitForUrl(devUrl, 20000, 200);
@@ -291,24 +391,16 @@ app.whenReady().then(async () => {
     mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
   }
 
-  // start display polling after window exists
-  try {
-    startDisplayPolling(1500);
-  } catch (e) {
-    console.error("startDisplayPolling err", e);
-  }
+  try { startDisplayPolling(1500); } catch (e) { console.error("startDisplayPolling err", e); }
 
-  // macOS activation behavior
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
-// ensure graceful quit
 app.on("window-all-closed", () => {
   try {
     if (process.platform !== "darwin") {
-      // close websocket server if running
       if (wsServer && wsServer.close) {
         try { wsServer.close(); } catch (e) { /* ignore */ }
       }
