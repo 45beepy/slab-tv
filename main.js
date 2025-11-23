@@ -1,13 +1,5 @@
-// main.js
-// Slab TV - complete main process
-// - Dev: waits for Vite and loads dev URL
-// - Remote: Express + WebSocket server with pairing QR (robust port retry)
-// - Display polling (xrandr wrapper in nativeHelpers)
-// - BrowserView-based Slab mode (embed web apps inside Electron window)
-// - IPC handlers for renderer <-> main (launch-slab, exit-slab, open-url-in-view, launch-app, config)
-// - Safety: single-instance lock, EADDRINUSE handling, Escape / Ctrl+Alt+Q to exit
-
-const { app, BrowserWindow, ipcMain, BrowserView } = require("electron");
+// main.js — SlabTV (Full Hybrid Security Mode Version)
+const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -18,30 +10,18 @@ const qrcode = require("qrcode");
 const fs = require("fs");
 const os = require("os");
 const { spawn } = require("child_process");
+
 const { detectDisplays, moveWindowToDisplay, launchApp } = require("./nativeHelpers");
 
-// Allow overriding remote port & dev URL via env (useful in CI / scripts)
-let REMOTE_PORT = process.env.REMOTE_PORT ? parseInt(process.env.REMOTE_PORT, 10) : 3000;
-const DEV_URL = process.env.VITE_DEV_URL || "http://localhost:5174";
+const REMOTE_PORT = 3000;
+const CONFIG_PATH = path.join(app.getPath('userData'), "slab-config.json");
 
-const CONFIG_PATH = path.join(app ? app.getPath("userData") : __dirname, "slab-config.json");
+let mainWindow;
+let wsServer;
 
-let mainWindow = null;
-let wsServer = null;
-let lastDisplaysJson = "[]";
-
-// BrowserView state
-let activeView = null;
-let previousBounds = null;
-let isInSlabMode = false;
-
-// Single-instance lock (prevent multiple main processes)
-if (app.requestSingleInstanceLock && !app.requestSingleInstanceLock()) {
-  // Another instance is running — exit
-  app.quit();
-}
-
-// --------------------- Config helpers ---------------------
+// ======================
+//      CONFIG HELPERS
+// ======================
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_PATH)) {
@@ -50,7 +30,13 @@ function loadConfig() {
   } catch (e) {
     console.error("loadConfig err", e);
   }
-  return { neverShowHdmiPopup: false, defaultApp: { appId: "chrome", args: ["--new-window"] } };
+  return {
+    securityMode: "open",        // open | pairing
+    pairedRemotes: [],
+    neverShowHdmiPopup: false,
+    defaultApp: { appId: "chrome", args: ["--new-window"], webUrl: "https://www.youtube.com/" },
+    appsTiles: []
+  };
 }
 
 function saveConfig(cfg) {
@@ -61,151 +47,43 @@ function saveConfig(cfg) {
   }
 }
 
-// --------------------- Window creation ---------------------
+// ======================
+//   ELECTRON WINDOW
+// ======================
 function createWindow() {
-mainWindow = new BrowserWindow({
-  width: 1280,
-  height: 720,
-  webPreferences: {
-    preload: path.join(__dirname, 'preload.js'), // <- must match file location
-    contextIsolation: true,
-    nodeIntegration: false
-  }
-});
-
-
-  // Add convenient keyboard handlers to the mainWindow to allow easy exit from Slab mode / app
-  mainWindow.webContents.on("before-input-event", (event, input) => {
-    try {
-      // Escape exits Slab mode
-      if (input.key === "Escape") {
-        event.preventDefault();
-        if (isInSlabMode) {
-          exitSlab().catch((e) => console.error("exitSlab err", e));
-        }
-      }
-      // Ctrl + Alt + Q quits the app
-      if (input.control && input.alt && input.key && input.key.toLowerCase() === "q") {
-        app.quit();
-      }
-    } catch (e) {
-      // swallow
+  mainWindow = new BrowserWindow({
+    width: 1280,
+    height: 720,
+    backgroundColor: "#0f172a",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false
     }
   });
 
-  // We'll load renderer content later (dev: loadURL; prod: loadFile).
+  mainWindow.loadFile("./renderer/index.html");
 }
 
-// --------------------- BrowserView helpers ---------------------
-async function openUrlInBrowserView(url) {
-  try {
-    if (!mainWindow) return { ok: false, error: "no-main-window" };
-
-    // Remove existing view if present
-    if (activeView) {
-      try {
-        mainWindow.removeBrowserView(activeView);
-        activeView.webContents.destroy();
-      } catch (e) {
-        /* ignore */
-      }
-      activeView = null;
-    }
-
-    // Save current bounds so we can restore after exit
-    try {
-      previousBounds = mainWindow.getBounds();
-    } catch (e) {
-      previousBounds = null;
-    }
-
-    activeView = new BrowserView({
-      webPreferences: {
-        contextIsolation: true,
-        nodeIntegration: false,
-        sandbox: true
-      }
-    });
-
-    mainWindow.setBrowserView(activeView);
-
-    // fill entire window (adjust y/x/height if you want a top bar)
-    const [w, h] = mainWindow.getSize();
-    activeView.setBounds({ x: 0, y: 0, width: w, height: h });
-    activeView.setAutoResize({ width: true, height: true });
-
-    await activeView.webContents.loadURL(url);
-
-    // focus the view so it receives input
-    try {
-      activeView.webContents.focus();
-    } catch (e) {}
-
-    isInSlabMode = true;
-    if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("slab-state", { slab: true });
-
-    return { ok: true };
-  } catch (e) {
-    console.error("openUrlInBrowserView error", e);
-    return { ok: false, error: e.message };
-  }
-}
-
-async function exitSlab() {
-  try {
-    if (!mainWindow) return { ok: false, error: "no-main-window" };
-
-    if (activeView) {
-      try {
-        mainWindow.removeBrowserView(activeView);
-        activeView.webContents.destroy();
-      } catch (e) {
-        /* ignore */
-      }
-      activeView = null;
-    }
-
-    try {
-      mainWindow.setFullScreen(false);
-    } catch (e) {}
-
-    if (previousBounds) {
-      try {
-        mainWindow.setBounds(previousBounds);
-      } catch (e) {}
-      previousBounds = null;
-    }
-
-    isInSlabMode = false;
-    if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("slab-state", { slab: false });
-
-    return { ok: true };
-  } catch (e) {
-    console.error("exitSlab error", e);
-    return { ok: false, error: e.message };
-  }
-}
-
-// --------------------- App launching / embedded logic ---------------------
+// ======================
+//   SLAB TV ACTIONS
+// ======================
 async function doLaunchSlab() {
   try {
-    if (!mainWindow) return { ok: false, error: "no-main-window" };
-
-    const cfg = loadConfig();
-    const defaultApp = cfg.defaultApp || { appId: "chrome", args: ["--new-window"] };
-
-    // Heuristic: look for an http(s) URL in args; else fallback to YouTube
-    const urlArg = (defaultApp.args || []).find((a) => /^https?:\/\//i.test(a));
-    const urlToOpen = urlArg || "https://www.youtube.com/";
-
-    // Put window into fullscreen then open view
-    try {
-      mainWindow.setFullScreen(true);
-    } catch (e) {}
-
-    return await openUrlInBrowserView(urlToOpen);
+    const displays = await detectDisplays();
+    if (displays.length > 1 && displays[1].geometry) {
+      const geo = displays[1].geometry;
+      const match = geo.match(/(\d+)x(\d+)\+(\d+)\+(\d+)/);
+      if (match) {
+        const width = +match[1], height = +match[2], x = +match[3], y = +match[4];
+        mainWindow.setBounds({ x, y, width, height });
+        setTimeout(() => mainWindow.setFullScreen(true), 150);
+        return { ok: true };
+      }
+    }
+    mainWindow.setFullScreen(true);
+    return { ok: true };
   } catch (e) {
-    console.error("doLaunchSlab err", e);
     return { ok: false, error: e.message };
   }
 }
@@ -213,21 +91,16 @@ async function doLaunchSlab() {
 async function doLaunchApp(appId, args = []) {
   try {
     let cmd = null;
-    let finalArgs = args || [];
     if (appId === "chrome") {
       cmd = "google-chrome";
-      if (finalArgs.length === 0) finalArgs = ["--new-window"];
     } else if (appId === "vlc") {
       cmd = "vlc";
-    } else if (appId === "stremio") {
-      cmd = "stremio";
     } else {
       cmd = appId;
     }
 
-    launchApp(cmd, finalArgs);
+    launchApp(cmd, args);
 
-    // best-effort move external app to external display
     setTimeout(async () => {
       try {
         const displays = await detectDisplays();
@@ -235,323 +108,296 @@ async function doLaunchApp(appId, args = []) {
           if (appId === "chrome") await moveWindowToDisplay("Google Chrome", displays[1]);
           if (appId === "vlc") await moveWindowToDisplay("VLC media player", displays[1]);
         }
-      } catch (err) {
-        console.error("post-launch move err", err);
-      }
+      } catch (e) {}
     }, 1000);
 
     return { ok: true };
   } catch (e) {
-    console.error("doLaunchApp err", e);
     return { ok: false, error: e.message };
   }
 }
 
-// --------------------- Remote server (Express + WebSocket) ---------------------
-async function startRemoteServer() {
-  // Express app
+async function doOpenUrlInView(url) {
+  if (!mainWindow) return { ok: false, error: "No window" };
+  try {
+    mainWindow.setFullScreen(true);
+    mainWindow.loadURL(url);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ======================
+//  REMOTE MSG HANDLER
+// ======================
+function handleRemoteMessage(data) {
+  if (!data) return;
+
+  // D-pad controls
+  if (data.type === "input" && data.sub === "dpad") {
+    const keyMap = { up: "Up", down: "Down", left: "Left", right: "Right", ok: "Return", back: "Escape" };
+    if (keyMap[data.dir]) spawn("xdotool", ["key", keyMap[data.dir]]);
+  }
+
+  // Mouse click
+  else if (data.type === "input" && data.sub === "mouse") {
+    spawn("xdotool", ["click", "1"]);
+  }
+
+  // Keyboard text
+  else if (data.type === "input" && data.sub === "text") {
+    spawn("xdotool", ["type", data.text]);
+  }
+
+  // Open web URL inside browser view
+  else if (data.type === "command" && data.name === "open_url") {
+    doOpenUrlInView(data.url);
+  }
+
+  // Launch native app
+  else if (data.type === "command" && data.name === "launch_app") {
+    doLaunchApp(data.appId, data.args || []);
+  }
+}
+
+// ======================
+// EXPRESS + WS REMOTE SERVER
+// ======================
+function startRemoteServer() {
   const appServer = express();
   appServer.use(bodyParser.json());
   appServer.use(express.static("remote"));
 
-  appServer.post("/api/launch-slab", async (req, res) => {
-    const result = await doLaunchSlab();
-    res.json(result);
-  });
-
-  appServer.post("/api/launch-app", async (req, res) => {
-    const body = req.body || {};
-    const appId = body.appId || (loadConfig().defaultApp || {}).appId || "chrome";
-    const args = body.args || (loadConfig().defaultApp || {}).args || [];
-    const result = await doLaunchApp(appId, args);
-    res.json(result);
-  });
-
-  appServer.get("/api/status", (req, res) => {
-    res.json({ ok: true, host: os.hostname() });
+  // Simple HTTP APIs
+  appServer.post("/api/open-url", (req, res) => {
+    const { url } = req.body;
+    doOpenUrlInView(url);
+    res.json({ ok: true });
   });
 
   const server = http.createServer(appServer);
   const wss = new WebSocket.Server({ server });
+  wsServer = wss;
 
   wss.on("connection", (socket) => {
-    console.log("Remote connected via websocket");
+    console.log("Remote connected");
+
+    const cfg = loadConfig();
+    const mode = cfg.securityMode || "open";
+
+    // In OPEN mode, socket is automatically trusted
+    socket.isPaired = (mode === "open");
 
     socket.on("message", async (msg) => {
-      try {
-        const data = JSON.parse(msg);
+      let data;
+      try { data = JSON.parse(msg); } catch { return; }
 
-        // D-pad / navigation input forwarding
-        if (data.type === "input" && data.sub === "dpad") {
-          const keyMap = {
-            up: "ArrowUp",
-            down: "ArrowDown",
-            left: "ArrowLeft",
-            right: "ArrowRight",
-            ok: "Enter",
-            back: "Escape",
-          };
-          const key = keyMap[data.dir];
-
-          if (activeView && activeView.webContents) {
-            try {
-              activeView.webContents.focus();
-              activeView.webContents.sendInputEvent({ type: "keyDown", keyCode: key });
-              activeView.webContents.sendInputEvent({ type: "keyUp", keyCode: key });
-            } catch (e) {
-              console.error("sendInputEvent error", e);
-            }
-          } else {
-            if (key) {
-              const fallback = key.replace("Arrow", ""); // ArrowUp -> Up
-              spawn("xdotool", ["key", fallback]);
-            }
-          }
-        }
-        // text input
-        else if (data.type === "input" && data.sub === "text") {
-          const text = data.text || "";
-          if (activeView && activeView.webContents) {
-            try {
-              for (const ch of text) {
-                activeView.webContents.sendInputEvent({ type: "char", keyCode: ch });
-              }
-            } catch (e) {
-              console.error("text input error", e);
-            }
-          } else {
-            spawn("xdotool", ["type", text]);
-          }
-        }
-        // open url command
-        else if (data.type === "command" && data.name === "open_url") {
-          const { url } = data;
-          if (url) {
-            if (activeView) {
-              try {
-                await activeView.webContents.loadURL(url);
-              } catch (e) {
-                console.error("open_url error", e);
-              }
-            } else {
-              await openUrlInBrowserView(url);
-            }
-          }
-        }
-        // launch native app
-        else if (data.type === "command" && data.name === "launch_app") {
-          const { appId, args } = data;
-          await doLaunchApp(appId, args);
-        }
-        // pairing
-        else if (data.type === "pair_request") {
-          const token = Math.random().toString(36).substring(2, 8);
-          const uri = `slabtv://pair?token=${token}&host=${os.hostname()}:${REMOTE_PORT}`;
-          const qr = await qrcode.toDataURL(uri);
-          socket.send(JSON.stringify({ type: "pair", token, qr }));
-        }
-      } catch (err) {
-        console.error("ws message err", err);
+      // Open mode → allow everything
+      if (mode === "open") {
+        handleRemoteMessage(data);
+        return;
       }
+
+      // Pairing mode
+      if (!socket.isPaired) {
+        if (data.type === "pair_request") {
+          const token = Math.random().toString(36).substring(2, 8);
+          const hostString = `${os.hostname()}:${REMOTE_PORT}`;
+          const pairingUri = `slabtv://pair?token=${token}&host=${hostString}`;
+          const qr = await qrcode.toDataURL(pairingUri);
+
+          socket.pairToken = token;
+
+          socket.send(JSON.stringify({
+            type: "pair",
+            token,
+            host: hostString,
+            uri: pairingUri,
+            qr
+          }));
+
+          mainWindow.webContents.send("pair-request", { token, host: hostString });
+
+          return;
+        }
+        return; // ignore other commands
+      }
+
+      // Already paired → accept commands
+      handleRemoteMessage(data);
     });
   });
 
-  // Try to listen with retries on EADDRINUSE (so the app won't crash)
-  const listenWithRetry = (serverInstance, startPort, maxRetries = 10) =>
-    new Promise((resolve, reject) => {
-      let attempts = 0;
-      const tryPort = (port) => {
-        serverInstance.listen(port, () => {
-          REMOTE_PORT = port; // update global to actual used port
-          console.log(`Remote server running on http://localhost:${port}`);
-          resolve(port);
-        });
-        serverInstance.once("error", (err) => {
-          if (err.code === "EADDRINUSE" && attempts < maxRetries) {
-            attempts++;
-            const next = port + 1;
-            console.warn(`Port ${port} in use, trying ${next} (attempt ${attempts})`);
-            setTimeout(() => tryPort(next), 200);
-          } else {
-            reject(err);
-          }
-        });
-      };
-      tryPort(startPort);
-    });
+  server.listen(REMOTE_PORT, () => {
+    console.log(`Remote server running at http://localhost:${REMOTE_PORT}`);
+  });
 
-  try {
-    await listenWithRetry(server, REMOTE_PORT, 10);
-  } catch (err) {
-    console.error("Failed to start remote server:", err);
-    // do not throw - we don't want the whole app to crash
-  }
-
-  wsServer = wss;
-
-  // advertise via mDNS (best effort)
-  try {
-    bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: "slabtv", port: REMOTE_PORT });
-  } catch (e) {
-    console.warn("mDNS advertise failed (bonjour)", e);
-  }
+  bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: "slabtv", port: REMOTE_PORT });
 }
 
-// --------------------- Display polling ---------------------
-async function startDisplayPolling(intervalMs = 1500) {
-  try {
-    const displays = await detectDisplays();
-    lastDisplaysJson = JSON.stringify(displays);
-    if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("displays-changed", displays);
-  } catch (e) {
-    console.error("initial display poll err", e);
-  }
-
-  setInterval(async () => {
+// ======================
+//   DISPLAY POLLING
+// ======================
+async function startDisplayPolling() {
+  async function poll() {
     try {
       const displays = await detectDisplays();
-      const json = JSON.stringify(displays);
-      if (json !== lastDisplaysJson) {
-        lastDisplaysJson = json;
-        if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("displays-changed", displays);
-      }
-    } catch (e) {
-      console.error("display poll err", e);
-    }
-  }, intervalMs);
+      mainWindow.webContents.send("displays-changed", displays);
+    } catch (e) {}
+  }
+  poll();
+  setInterval(poll, 1500);
 }
 
-// --------------------- IPC handlers ---------------------
-ipcMain.handle("launch-slab", async () => {
-  return await doLaunchSlab();
-});
-ipcMain.handle("exit-slab", async () => {
-  return await exitSlab();
-});
-ipcMain.handle("open-url-in-view", async (evt, url) => {
-  return await openUrlInBrowserView(url);
-});
-ipcMain.handle("get-config", async () => {
-  return loadConfig();
-});
-ipcMain.handle("save-config", async (evt, cfg) => {
-  saveConfig(cfg);
+// ======================
+//     IPC HANDLERS
+// ======================
+ipcMain.handle("launch-slab", () => doLaunchSlab());
+ipcMain.handle("launch-app", (e, appId, args) => doLaunchApp(appId, args));
+ipcMain.handle("open-url-in-view", (e, url) => doOpenUrlInView(url));
+ipcMain.handle("get-config", () => loadConfig());
+ipcMain.handle("save-config", (e, cfg) => { saveConfig(cfg); return { ok: true }; });
+
+// Approve pairing
+ipcMain.handle("approve-remote", async (evt, token) => {
+  const cfg = loadConfig();
+  cfg.pairedRemotes = cfg.pairedRemotes || [];
+
+  if (!cfg.pairedRemotes.includes(token)) {
+    cfg.pairedRemotes.push(token);
+    saveConfig(cfg);
+  }
+
+  // Activate any socket waiting for this token
+  wsServer.clients.forEach(client => {
+    if (client.pairToken === token) client.isPaired = true;
+  });
+
   return { ok: true };
 });
-ipcMain.handle("launch-app", async (evt, appId, args) => {
-  return await doLaunchApp(appId, args);
-});
 
-ipcMain.handle("launch-slab-choice", async (evt, choice) => {
-  // choice is expected: 'chrome' | 'stremio' | 'vlc' | or { type:'web', url:'...' } etc.
-  try {
-    const cfg = loadConfig();
-    if (typeof choice === "string") {
-      if (choice === "chrome") {
-        // use default url from config or fallback to youtube
-        const url = (cfg.defaultApp && cfg.defaultApp.webUrl) || "https://www.youtube.com/";
-        return await openUrlInBrowserView(url);
-      } else if (choice === "stremio") {
-        // Stremio has a web-app at https://www.stremio.com/ (or local client) — open in view
-        // If you prefer the installed Stremio native app, call doLaunchApp('stremio')
-        const stremioUrl = (cfg.apps && cfg.apps.stremio && cfg.apps.stremio.webUrl) || "https://www.stremio.com/";
-        // Try web-embed first
-        return await openUrlInBrowserView(stremioUrl);
-      } else if (choice === "vlc") {
-        // VLC is a native app — launch externally
-        return await doLaunchApp("vlc", []); // opens system VLC
-      } else {
-        return { ok: false, error: "unknown choice" };
-      }
-    } else if (choice && choice.type === "web" && choice.url) {
-      return await openUrlInBrowserView(choice.url);
-    } else if (choice && choice.type === "native" && choice.appId) {
-      return await doLaunchApp(choice.appId, choice.args || []);
-    } else {
-      return { ok: false, error: "invalid choice payload" };
-    }
-  } catch (e) {
-    console.error("launch-slab-choice err", e);
-    return { ok: false, error: e.message };
-  }
-});
-// --------------------- waitForUrl helper ---------------------
-async function waitForUrl(url, timeout = 20000, interval = 200) {
+// ======================
+// APP LIFECYCLE
+// ======================
+
+// helper: wait for an HTTP URL to respond (simple poll)
+function waitForUrl(url, timeoutMs = 20000, intervalMs = 200) {
   const start = Date.now();
-  while (Date.now() - start < timeout) {
-    try {
-      await new Promise((resolve, reject) => {
-        const req = http.get(url, (res) => {
-          res.destroy();
-          resolve();
-        });
-        req.on("error", reject);
+  return new Promise((resolve) => {
+    (function tryOnce() {
+      const req = http.request(url, { method: 'HEAD', timeout: 1500 }, (res) => {
+        resolve(true);
       });
-      return true;
-    } catch (e) {
-      await new Promise((r) => setTimeout(r, interval));
-    }
-  }
-  return false;
+      req.on('error', () => {
+        if (Date.now() - start > timeoutMs) return resolve(false);
+        setTimeout(tryOnce, intervalMs);
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        if (Date.now() - start > timeoutMs) return resolve(false);
+        setTimeout(tryOnce, intervalMs);
+      });
+      req.end();
+    })();
+  });
 }
 
-// --------------------- App lifecycle ---------------------
+
+// robust app.whenReady() — try dev server, fallback to local file, and log failures
+async function waitForUrl(url, timeoutMs = 20000, intervalMs = 250) {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    (function tryOnce() {
+      const req = http.request(url, { method: 'HEAD', timeout: 1500 }, (res) => {
+        resolve(true);
+      });
+      req.on('error', () => {
+        if (Date.now() - start > timeoutMs) return resolve(false);
+        setTimeout(tryOnce, intervalMs);
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        if (Date.now() - start > timeoutMs) return resolve(false);
+        setTimeout(tryOnce, intervalMs);
+      });
+      req.end();
+    })();
+  });
+}
+
 app.whenReady().then(async () => {
   createWindow();
 
-  // start remote server (best effort)
-  try {
-    await startRemoteServer();
-  } catch (e) {
-    console.error("startRemoteServer error", e);
-  }
+  // log some helpful paths to terminal for debugging:
+  console.log("Preload path:", path.join(__dirname, "preload.js"));
+  console.log("Renderer index path:", path.join(__dirname, "renderer", "index.html"));
 
-  // load renderer content: dev server or static file
-  if (process.env.NODE_ENV !== "production") {
+  const devUrl = "http://localhost:5175"; // <- set this to exact port Vite printed
+
+  // clean handlers to catch failed loads / crashes
+  mainWindow.webContents.once('did-finish-load', () => {
+    console.log('Renderer finished loading:', mainWindow.webContents.getURL());
+  });
+
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    console.error('did-fail-load:', { errorCode, errorDescription, validatedURL, isMainFrame });
+    if (validatedURL && validatedURL.startsWith('http') && errorCode !== -3) {
+      // if http load failed for a reason other than fallback -3, try fallback
+      try {
+        mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+      } catch (err) {
+        console.error("loadFile fallback error:", err);
+      }
+    }
+  });
+
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    console.error('Renderer process gone:', details);
+    // try to reload a local file to recover
     try {
-      const up = await waitForUrl(DEV_URL, 20000, 200);
+      mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+    } catch (err) {
+      console.error("reload fallback failed:", err);
+    }
+  });
+
+  try {
+    if (process.env.NODE_ENV !== "production") {
+      const up = await waitForUrl(devUrl, 20000, 250);
       if (up) {
-        mainWindow.loadURL(DEV_URL);
+        console.log("Dev server available, loading:", devUrl);
+        try {
+          await mainWindow.loadURL(devUrl);
+          console.log("Loaded dev server into Electron:", devUrl);
+        } catch (loadErr) {
+          console.error("Error loading dev URL:", loadErr);
+          // fallback to local file
+          try {
+            mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+          } catch (err) {
+            console.error("Fallback loadFile error:", err);
+          }
+        }
       } else {
-        console.warn("Dev server not responding, falling back to local file");
+        console.warn("Dev server not available — loading local index.html");
         mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
       }
-    } catch (e) {
-      console.error("URL wait error", e);
+    } else {
       mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
     }
-  } else {
-    mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
-  }
-
-  // start display polling
-  try {
-    startDisplayPolling(1500);
   } catch (e) {
-    console.error("startDisplayPolling err", e);
-  }
-
-  // macOS activation behavior
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
-});
-
-// ensure graceful quit
-app.on("window-all-closed", () => {
-  try {
-    if (process.platform !== "darwin") {
-      if (wsServer && wsServer.close) {
-        try {
-          wsServer.close();
-        } catch (e) {
-          /* ignore */
-        }
-      }
-      app.quit();
+    console.error("Error while waiting for dev server:", e);
+    try {
+      mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+    } catch (err) {
+      console.error("Final fallback error loading file:", err);
     }
-  } catch (e) {
-    console.error("window-all-closed handler err", e);
-    app.quit();
   }
+
+  // start the rest of your services
+  startRemoteServer();
+  startDisplayPolling();
 });
+
+app.on("window-all-closed", () => app.quit());

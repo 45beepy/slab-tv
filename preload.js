@@ -1,24 +1,31 @@
+// preload.js — Exposes safe IPC bridge APIs to renderer
+const { contextBridge, ipcRenderer } = require("electron");
 
-// preload.js
-const { contextBridge, ipcRenderer } = require('electron');
+contextBridge.exposeInMainWorld("slab", {
+  // Launch Slab TV fullscreen on HDMI
+  launchSlab: () => ipcRenderer.invoke("launch-slab"),
 
-contextBridge.exposeInMainWorld('slab', {
-  // displays
-  onDisplaysChanged: (cb) => {
-    ipcRenderer.on('displays-changed', (evt, displays) => cb(displays));
+  // Launch native app (chrome, vlc, etc.)
+  launchApp: (appId, args) => ipcRenderer.invoke("launch-app", appId, args),
+
+  // Open URL inside Electron BrowserView/kiosk
+  openUrlInView: (url) => ipcRenderer.invoke("open-url-in-view", url),
+
+  // Config access
+  getConfig: () => ipcRenderer.invoke("get-config"),
+  saveConfig: (cfg) => ipcRenderer.invoke("save-config", cfg),
+
+  // Pairing approval
+  approveRemote: (token) => ipcRenderer.invoke("approve-remote", token),
+
+  // Renderer listens to pairing requests
+  onPairRequest: (cb) => {
+    ipcRenderer.on("pair-request", (_, data) => cb(data));
   },
 
-  // slab actions
-  launchSlab: async () => ipcRenderer.invoke('launch-slab'),
-  launchSlabChoice: async (choice) => ipcRenderer.invoke('launch-slab-choice', choice),
-  exitSlab: async () => ipcRenderer.invoke('exit-slab'),
-  openUrlInView: async (url) => ipcRenderer.invoke('open-url-in-view', url),
-
-  // config
-  getConfig: async () => ipcRenderer.invoke('get-config'),
-  saveConfig: async (cfg) => ipcRenderer.invoke('save-config', cfg),
-
-  // native apps
-  launchApp: async (appId, args) => ipcRenderer.invoke('launch-app', appId, args)
+  // Renderer listens for display changes (HDMI hotplug)
+  onDisplaysChanged: (cb) => {
+    ipcRenderer.on("displays-changed", (_, displays) => cb(displays));
+  }
 });
 
