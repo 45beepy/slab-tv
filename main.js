@@ -1,10 +1,11 @@
 // main.js
-// Complete main process for Slab TV (development-friendly)
+// Slab TV - complete main process
 // - Dev: waits for Vite and loads dev URL
-// - Remote: Express + WebSocket server with pairing QR
+// - Remote: Express + WebSocket server with pairing QR (robust port retry)
 // - Display polling (xrandr wrapper in nativeHelpers)
 // - BrowserView-based Slab mode (embed web apps inside Electron window)
 // - IPC handlers for renderer <-> main (launch-slab, exit-slab, open-url-in-view, launch-app, config)
+// - Safety: single-instance lock, EADDRINUSE handling, Escape / Ctrl+Alt+Q to exit
 
 const { app, BrowserWindow, ipcMain, BrowserView } = require("electron");
 const path = require("path");
@@ -19,17 +20,26 @@ const os = require("os");
 const { spawn } = require("child_process");
 const { detectDisplays, moveWindowToDisplay, launchApp } = require("./nativeHelpers");
 
-const REMOTE_PORT = 3000;
+// Allow overriding remote port & dev URL via env (useful in CI / scripts)
+let REMOTE_PORT = process.env.REMOTE_PORT ? parseInt(process.env.REMOTE_PORT, 10) : 3000;
+const DEV_URL = process.env.VITE_DEV_URL || "http://localhost:5174";
+
 const CONFIG_PATH = path.join(app ? app.getPath("userData") : __dirname, "slab-config.json");
 
 let mainWindow = null;
 let wsServer = null;
 let lastDisplaysJson = "[]";
 
-// BrowserView / Slab-mode state
+// BrowserView state
 let activeView = null;
 let previousBounds = null;
 let isInSlabMode = false;
+
+// Single-instance lock (prevent multiple main processes)
+if (app.requestSingleInstanceLock && !app.requestSingleInstanceLock()) {
+  // Another instance is running — exit
+  app.quit();
+}
 
 // --------------------- Config helpers ---------------------
 function loadConfig() {
@@ -63,22 +73,50 @@ function createWindow() {
     }
   });
 
+  // Add convenient keyboard handlers to the mainWindow to allow easy exit from Slab mode / app
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    try {
+      // Escape exits Slab mode
+      if (input.key === "Escape") {
+        event.preventDefault();
+        if (isInSlabMode) {
+          exitSlab().catch((e) => console.error("exitSlab err", e));
+        }
+      }
+      // Ctrl + Alt + Q quits the app
+      if (input.control && input.alt && input.key && input.key.toLowerCase() === "q") {
+        app.quit();
+      }
+    } catch (e) {
+      // swallow
+    }
+  });
+
   // We'll load renderer content later (dev: loadURL; prod: loadFile).
 }
 
 // --------------------- BrowserView helpers ---------------------
 async function openUrlInBrowserView(url) {
   try {
-    // remove existing view
+    if (!mainWindow) return { ok: false, error: "no-main-window" };
+
+    // Remove existing view if present
     if (activeView) {
       try {
         mainWindow.removeBrowserView(activeView);
         activeView.webContents.destroy();
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        /* ignore */
+      }
       activeView = null;
     }
 
-    previousBounds = mainWindow.getBounds();
+    // Save current bounds so we can restore after exit
+    try {
+      previousBounds = mainWindow.getBounds();
+    } catch (e) {
+      previousBounds = null;
+    }
 
     activeView = new BrowserView({
       webPreferences: {
@@ -90,16 +128,17 @@ async function openUrlInBrowserView(url) {
 
     mainWindow.setBrowserView(activeView);
 
-    // fill the whole window (change if you want a top bar)
+    // fill entire window (adjust y/x/height if you want a top bar)
     const [w, h] = mainWindow.getSize();
     activeView.setBounds({ x: 0, y: 0, width: w, height: h });
     activeView.setAutoResize({ width: true, height: true });
 
-    // load URL
     await activeView.webContents.loadURL(url);
 
-    // focus so it can receive input
-    activeView.webContents.focus();
+    // focus the view so it receives input
+    try {
+      activeView.webContents.focus();
+    } catch (e) {}
 
     isInSlabMode = true;
     if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("slab-state", { slab: true });
@@ -113,22 +152,32 @@ async function openUrlInBrowserView(url) {
 
 async function exitSlab() {
   try {
+    if (!mainWindow) return { ok: false, error: "no-main-window" };
+
     if (activeView) {
       try {
         mainWindow.removeBrowserView(activeView);
         activeView.webContents.destroy();
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        /* ignore */
+      }
       activeView = null;
     }
 
-    try { mainWindow.setFullScreen(false); } catch (e) {}
+    try {
+      mainWindow.setFullScreen(false);
+    } catch (e) {}
+
     if (previousBounds) {
-      try { mainWindow.setBounds(previousBounds); } catch (e) {}
+      try {
+        mainWindow.setBounds(previousBounds);
+      } catch (e) {}
       previousBounds = null;
     }
 
     isInSlabMode = false;
     if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("slab-state", { slab: false });
+
     return { ok: true };
   } catch (e) {
     console.error("exitSlab error", e);
@@ -139,15 +188,19 @@ async function exitSlab() {
 // --------------------- App launching / embedded logic ---------------------
 async function doLaunchSlab() {
   try {
+    if (!mainWindow) return { ok: false, error: "no-main-window" };
+
     const cfg = loadConfig();
     const defaultApp = cfg.defaultApp || { appId: "chrome", args: ["--new-window"] };
 
-    // try to find a URL in args (simple heuristic)
-    const urlArg = (defaultApp.args || []).find(a => /^https?:\/\//i.test(a));
+    // Heuristic: look for an http(s) URL in args; else fallback to YouTube
+    const urlArg = (defaultApp.args || []).find((a) => /^https?:\/\//i.test(a));
     const urlToOpen = urlArg || "https://www.youtube.com/";
 
-    // Make the window fullscreen (so BrowserView will fill it)
-    try { mainWindow.setFullScreen(true); } catch (e) {}
+    // Put window into fullscreen then open view
+    try {
+      mainWindow.setFullScreen(true);
+    } catch (e) {}
 
     return await openUrlInBrowserView(urlToOpen);
   } catch (e) {
@@ -158,7 +211,6 @@ async function doLaunchSlab() {
 
 async function doLaunchApp(appId, args = []) {
   try {
-    // Fallback: for native apps, keep launching externally
     let cmd = null;
     let finalArgs = args || [];
     if (appId === "chrome") {
@@ -174,7 +226,7 @@ async function doLaunchApp(appId, args = []) {
 
     launchApp(cmd, finalArgs);
 
-    // attempt best-effort move to external display (if any)
+    // best-effort move external app to external display
     setTimeout(async () => {
       try {
         const displays = await detectDisplays();
@@ -195,7 +247,8 @@ async function doLaunchApp(appId, args = []) {
 }
 
 // --------------------- Remote server (Express + WebSocket) ---------------------
-function startRemoteServer() {
+async function startRemoteServer() {
+  // Express app
   const appServer = express();
   appServer.use(bodyParser.json());
   appServer.use(express.static("remote"));
@@ -220,65 +273,77 @@ function startRemoteServer() {
   const server = http.createServer(appServer);
   const wss = new WebSocket.Server({ server });
 
-  wss.on("connection", socket => {
+  wss.on("connection", (socket) => {
     console.log("Remote connected via websocket");
 
-    socket.on("message", async msg => {
+    socket.on("message", async (msg) => {
       try {
         const data = JSON.parse(msg);
 
         // D-pad / navigation input forwarding
         if (data.type === "input" && data.sub === "dpad") {
-          const keyMap = { up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight", ok: "Enter", back: "Escape" };
+          const keyMap = {
+            up: "ArrowUp",
+            down: "ArrowDown",
+            left: "ArrowLeft",
+            right: "ArrowRight",
+            ok: "Enter",
+            back: "Escape",
+          };
           const key = keyMap[data.dir];
 
           if (activeView && activeView.webContents) {
             try {
               activeView.webContents.focus();
-              // send a down+up to emulate a press
               activeView.webContents.sendInputEvent({ type: "keyDown", keyCode: key });
               activeView.webContents.sendInputEvent({ type: "keyUp", keyCode: key });
             } catch (e) {
               console.error("sendInputEvent error", e);
             }
           } else {
-            // fallback to xdotool (system-level)
             if (key) {
               const fallback = key.replace("Arrow", ""); // ArrowUp -> Up
               spawn("xdotool", ["key", fallback]);
             }
           }
-
-        } else if (data.type === "input" && data.sub === "text") {
-          // For text, send keystrokes to the view or fallback to xdotool
+        }
+        // text input
+        else if (data.type === "input" && data.sub === "text") {
           const text = data.text || "";
           if (activeView && activeView.webContents) {
             try {
-              // send each char (basic)
               for (const ch of text) {
                 activeView.webContents.sendInputEvent({ type: "char", keyCode: ch });
               }
-            } catch (e) { console.error("text input error", e); }
+            } catch (e) {
+              console.error("text input error", e);
+            }
           } else {
             spawn("xdotool", ["type", text]);
           }
-
-        } else if (data.type === "command" && data.name === "launch_app") {
+        }
+        // open url command
+        else if (data.type === "command" && data.name === "open_url") {
+          const { url } = data;
+          if (url) {
+            if (activeView) {
+              try {
+                await activeView.webContents.loadURL(url);
+              } catch (e) {
+                console.error("open_url error", e);
+              }
+            } else {
+              await openUrlInBrowserView(url);
+            }
+          }
+        }
+        // launch native app
+        else if (data.type === "command" && data.name === "launch_app") {
           const { appId, args } = data;
           await doLaunchApp(appId, args);
-
-        } else if (data.type === "command" && data.name === "open_url") {
-          const { url } = data;
-          if (url && activeView) {
-            try {
-              await activeView.webContents.loadURL(url);
-            } catch (e) { console.error("open_url error", e); }
-          } else if (url) {
-            // if not in view, launch slab mode using the URL
-            await openUrlInBrowserView(url);
-          }
-
-        } else if (data.type === "pair_request") {
+        }
+        // pairing
+        else if (data.type === "pair_request") {
           const token = Math.random().toString(36).substring(2, 8);
           const uri = `slabtv://pair?token=${token}&host=${os.hostname()}:${REMOTE_PORT}`;
           const qr = await qrcode.toDataURL(uri);
@@ -290,12 +355,40 @@ function startRemoteServer() {
     });
   });
 
-  server.listen(REMOTE_PORT, () => {
-    console.log(`Remote server running on http://localhost:${REMOTE_PORT}`);
-  });
+  // Try to listen with retries on EADDRINUSE (so the app won't crash)
+  const listenWithRetry = (serverInstance, startPort, maxRetries = 10) =>
+    new Promise((resolve, reject) => {
+      let attempts = 0;
+      const tryPort = (port) => {
+        serverInstance.listen(port, () => {
+          REMOTE_PORT = port; // update global to actual used port
+          console.log(`Remote server running on http://localhost:${port}`);
+          resolve(port);
+        });
+        serverInstance.once("error", (err) => {
+          if (err.code === "EADDRINUSE" && attempts < maxRetries) {
+            attempts++;
+            const next = port + 1;
+            console.warn(`Port ${port} in use, trying ${next} (attempt ${attempts})`);
+            setTimeout(() => tryPort(next), 200);
+          } else {
+            reject(err);
+          }
+        });
+      };
+      tryPort(startPort);
+    });
+
+  try {
+    await listenWithRetry(server, REMOTE_PORT, 10);
+  } catch (err) {
+    console.error("Failed to start remote server:", err);
+    // do not throw - we don't want the whole app to crash
+  }
 
   wsServer = wss;
 
+  // advertise via mDNS (best effort)
   try {
     bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: "slabtv", port: REMOTE_PORT });
   } catch (e) {
@@ -348,18 +441,21 @@ ipcMain.handle("launch-app", async (evt, appId, args) => {
   return await doLaunchApp(appId, args);
 });
 
-// --------------------- Helper: wait for URL ---------------------
+// --------------------- waitForUrl helper ---------------------
 async function waitForUrl(url, timeout = 20000, interval = 200) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     try {
       await new Promise((resolve, reject) => {
-        const req = http.get(url, res => { res.destroy(); resolve(); });
+        const req = http.get(url, (res) => {
+          res.destroy();
+          resolve();
+        });
         req.on("error", reject);
       });
       return true;
     } catch (e) {
-      await new Promise(r => setTimeout(r, interval));
+      await new Promise((r) => setTimeout(r, interval));
     }
   }
   return false;
@@ -369,16 +465,19 @@ async function waitForUrl(url, timeout = 20000, interval = 200) {
 app.whenReady().then(async () => {
   createWindow();
 
-  // start remote API early
-  try { startRemoteServer(); } catch (e) { console.error("startRemoteServer error", e); }
+  // start remote server (best effort)
+  try {
+    await startRemoteServer();
+  } catch (e) {
+    console.error("startRemoteServer error", e);
+  }
 
-  // load renderer (dev: loadURL once vite is ready; prod: load built files)
-  const devUrl = process.env.VITE_DEV_URL || "http://localhost:5174";
+  // load renderer content: dev server or static file
   if (process.env.NODE_ENV !== "production") {
     try {
-      const up = await waitForUrl(devUrl, 20000, 200);
+      const up = await waitForUrl(DEV_URL, 20000, 200);
       if (up) {
-        mainWindow.loadURL(devUrl);
+        mainWindow.loadURL(DEV_URL);
       } else {
         console.warn("Dev server not responding, falling back to local file");
         mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
@@ -391,18 +490,29 @@ app.whenReady().then(async () => {
     mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
   }
 
-  try { startDisplayPolling(1500); } catch (e) { console.error("startDisplayPolling err", e); }
+  // start display polling
+  try {
+    startDisplayPolling(1500);
+  } catch (e) {
+    console.error("startDisplayPolling err", e);
+  }
 
+  // macOS activation behavior
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
+// ensure graceful quit
 app.on("window-all-closed", () => {
   try {
     if (process.platform !== "darwin") {
       if (wsServer && wsServer.close) {
-        try { wsServer.close(); } catch (e) { /* ignore */ }
+        try {
+          wsServer.close();
+        } catch (e) {
+          /* ignore */
+        }
       }
       app.quit();
     }
