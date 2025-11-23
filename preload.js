@@ -6,8 +6,15 @@ contextBridge.exposeInMainWorld("slab", {
     ipcRenderer.on("displays-changed", (_, displays) => cb(displays));
   },
   launchSlab: async () => {
-    // returns result {ok:true|false}
     return await ipcRenderer.invoke("launch-slab");
+  },
+  getConfig: async () => {
+    return await ipcRenderer.invoke("get-config");
+  },
+  saveConfig: async (cfg) => {
+    return await ipcRenderer.invoke("save-config", cfg);
+  },
+  launchApp: async (appId, args) => {
+    return await ipcRenderer.invoke("launch-app", appId, args);
   }
 });
-

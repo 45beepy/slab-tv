@@ -3,20 +3,38 @@
   <head>
     <meta charset="utf-8" />
     <title>Slab TV Remote</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script>
+      // quick styles
+      document.addEventListener('DOMContentLoaded', ()=>{ document.body.style.fontFamily='Inter, sans-serif'; document.body.style.background='#111827'; document.body.style.color='#fff'; document.body.style.padding='20px'; });
+    </script>
   </head>
   <body>
     <h1>Slab TV Remote</h1>
-
     <button id="pair">Pair Device</button>
     <div id="qr"></div>
 
     <h2>Controls</h2>
-    <button id="up">Up</button>
-    <button id="down">Down</button>
-    <button id="left">Left</button>
-    <button id="right">Right</button>
-    <button id="ok">OK</button>
+    <div>
+      <button id="up">Up</button>
+      <button id="down">Down</button>
+      <button id="left">Left</button>
+      <button id="right">Right</button>
+      <button id="ok">OK</button>
+    </div>
+
+    <h2>Remote API (demo)</h2>
+    <div style="margin-top:12px;">
+      <button id="apiLaunchSlab">API: Launch Slab</button>
+      <button id="apiLaunchApp">API: Launch Chrome Kiosk</button>
+    </div>
 
     <script src="./app.js"></script>
+    <script>
+      document.getElementById('apiLaunchSlab').onclick = ()=> fetch('/api/launch-slab', { method:'POST'}).then(r=>r.json()).then(j=>alert(JSON.stringify(j)));
+      document.getElementById('apiLaunchApp').onclick = ()=> fetch('/api/launch-app', {
+        method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ appId: 'chrome', args: ['--new-window','--kiosk','https://youtube.com']})
+      }).then(r=>r.json()).then(j=>alert(JSON.stringify(j)));
+    </script>
   </body>
 </html>
