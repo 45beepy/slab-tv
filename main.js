@@ -63,15 +63,16 @@ function saveConfig(cfg) {
 
 // --------------------- Window creation ---------------------
 function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 720,
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
+mainWindow = new BrowserWindow({
+  width: 1280,
+  height: 720,
+  webPreferences: {
+    preload: path.join(__dirname, 'preload.js'), // <- must match file location
+    contextIsolation: true,
+    nodeIntegration: false
+  }
+});
+
 
   // Add convenient keyboard handlers to the mainWindow to allow easy exit from Slab mode / app
   mainWindow.webContents.on("before-input-event", (event, input) => {
@@ -441,6 +442,39 @@ ipcMain.handle("launch-app", async (evt, appId, args) => {
   return await doLaunchApp(appId, args);
 });
 
+ipcMain.handle("launch-slab-choice", async (evt, choice) => {
+  // choice is expected: 'chrome' | 'stremio' | 'vlc' | or { type:'web', url:'...' } etc.
+  try {
+    const cfg = loadConfig();
+    if (typeof choice === "string") {
+      if (choice === "chrome") {
+        // use default url from config or fallback to youtube
+        const url = (cfg.defaultApp && cfg.defaultApp.webUrl) || "https://www.youtube.com/";
+        return await openUrlInBrowserView(url);
+      } else if (choice === "stremio") {
+        // Stremio has a web-app at https://www.stremio.com/ (or local client) — open in view
+        // If you prefer the installed Stremio native app, call doLaunchApp('stremio')
+        const stremioUrl = (cfg.apps && cfg.apps.stremio && cfg.apps.stremio.webUrl) || "https://www.stremio.com/";
+        // Try web-embed first
+        return await openUrlInBrowserView(stremioUrl);
+      } else if (choice === "vlc") {
+        // VLC is a native app — launch externally
+        return await doLaunchApp("vlc", []); // opens system VLC
+      } else {
+        return { ok: false, error: "unknown choice" };
+      }
+    } else if (choice && choice.type === "web" && choice.url) {
+      return await openUrlInBrowserView(choice.url);
+    } else if (choice && choice.type === "native" && choice.appId) {
+      return await doLaunchApp(choice.appId, choice.args || []);
+    } else {
+      return { ok: false, error: "invalid choice payload" };
+    }
+  } catch (e) {
+    console.error("launch-slab-choice err", e);
+    return { ok: false, error: e.message };
+  }
+});
 // --------------------- waitForUrl helper ---------------------
 async function waitForUrl(url, timeout = 20000, interval = 200) {
   const start = Date.now();
