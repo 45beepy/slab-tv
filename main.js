@@ -16,6 +16,10 @@ const DEV_URL = process.env.DEV_URL || "http://localhost:5173"; // change via en
 const CONFIG_PATH = path.join(app.getPath("userData") || __dirname, "slab-config.json");
 const DEFAULT_DEMO_ICON = "/mnt/data/f8b34732-0d43-4dbd-b74c-8c12d532a9cd.png"; // uploaded file path
 
+process.on("unhandledRejection", (err) => {
+  console.error("unhandledRejection:", err);
+});
+
 // Attempt to load native helpers (you must have nativeHelpers.js exporting the functions)
 let nativeHelpers = {};
 try {
@@ -243,17 +247,12 @@ async function doOpenUrlInView(url) {
 }
 
 // -------------------- Remote server (express + ws) --------------------
+
 function startRemoteServer() {
   const appServer = express();
   appServer.use(bodyParser.json());
   appServer.use(express.static(path.join(__dirname, "remote")));
-  
-  // if using the handler that parses messages into `data`
-  if (data.type === "command" && data.name === "exit_tile") {
-    exitTileAction().catch(err => console.error("exitTileAction err (remote)", err));
-  }
 
-  // API endpoints
   appServer.post("/api/launch-slab", async (req, res) => {
     res.json(await doLaunchSlab());
   });
@@ -275,20 +274,30 @@ function startRemoteServer() {
   wsServer = wss;
 
   wss.on("connection", (socket) => {
-    console.log("Remote connected via WS");
+    console.log("Remote WS connected");
 
+    // decide pairing mode from config
     const cfg = loadConfig();
     const mode = cfg.securityMode || "open";
-    socket.isPaired = mode === "open";
+    socket.isPaired = (mode === "open");
 
-    socket.on("message", async (raw) => {
+    socket.on("message", async (msg) => {
+      // parse once, safely
+      let data;
       try {
-        const data = JSON.parse(raw);
+        // msg may be a Buffer or string
+        const txt = (typeof msg === "string") ? msg : msg.toString();
+        data = JSON.parse(txt);
+      } catch (err) {
+        console.warn("WS: failed to parse message, ignoring:", err);
+        return; // ignore invalid messages
+      }
 
-        // pairing mode handling
-        if (!socket.isPaired && mode === "pairing") {
+      try {
+        // If pairing mode and not yet paired, only allow pair_request
+        if (mode === "pairing" && !socket.isPaired) {
           if (data.type === "pair_request") {
-            const token = Math.random().toString(36).slice(2, 8);
+            const token = Math.random().toString(36).substring(2, 8);
             const hostString = `${os.hostname()}:${REMOTE_PORT}`;
             const uri = `slabtv://pair?token=${token}&host=${hostString}`;
             const qr = await qrcode.toDataURL(uri);
@@ -296,34 +305,44 @@ function startRemoteServer() {
             socket.pairToken = token;
             socket.send(JSON.stringify({ type: "pair", token, host: hostString, uri, qr }));
 
-            // notify renderer UI
             if (mainWindow && mainWindow.webContents) {
               mainWindow.webContents.send("pair-request", { token, host: hostString });
             }
           }
+          // ignore other messages until paired
           return;
         }
 
-        // open mode or paired: process commands
+        // from here on, socket is either open-mode or paired
         if (data.type === "input" && data.sub === "dpad") {
           const keyMap = { up: "Up", down: "Down", left: "Left", right: "Right", ok: "Return", back: "Escape" };
           if (keyMap[data.dir]) spawn("xdotool", ["key", keyMap[data.dir]]);
         } else if (data.type === "input" && data.sub === "mouse") {
+          // mouse: either simulate click or add x/y later
           spawn("xdotool", ["click", "1"]);
         } else if (data.type === "input" && data.sub === "text") {
-          spawn("xdotool", ["type", data.text]);
+          spawn("xdotool", ["type", data.text || ""]);
         } else if (data.type === "command" && data.name === "open_url") {
-          doOpenUrlInView(data.url);
+          if (data.url) await doOpenUrlInView(data.url);
         } else if (data.type === "command" && data.name === "launch_app") {
-          doLaunchApp(data.appId, data.args || []);
+          await doLaunchApp(data.appId, data.args || []);
+        } else if (data.type === "command" && data.name === "exit_tile") {
+          // optional remote-triggered exit
+          await exitTileAction();
+        } else {
+          console.log("WS: unknown message type:", data);
         }
-      } catch (err) {
-        console.error("ws message parse/handle err", err);
+      } catch (handlerErr) {
+        console.error("WS message handler error:", handlerErr);
       }
     });
 
     socket.on("close", () => {
-      console.log("Remote WS closed");
+      console.log("Remote WS disconnected");
+    });
+
+    socket.on("error", (err) => {
+      console.error("Remote WS error:", err);
     });
   });
 
@@ -331,7 +350,12 @@ function startRemoteServer() {
     console.log(`Remote server listening at http://localhost:${REMOTE_PORT}`);
   });
 
-  bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: "slabtv", port: REMOTE_PORT });
+  // advertise service on local network
+  try {
+    bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: "slabtv", port: REMOTE_PORT });
+  } catch (e) {
+    console.warn("Bonjour publish failed:", e);
+  }
 }
 
 // -------------------- Display polling --------------------
