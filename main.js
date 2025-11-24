@@ -80,6 +80,15 @@ function createWindow() {
       nodeIntegration: false
     }
   });
+  // catch Escape (and other keys) before the page gets them
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+  // input: { type, key, code, ... }
+    if (input && input.type === "keyDown" && input.key === "Escape") {
+      event.preventDefault();   // stop page from receiving it
+    // call the action (no need to await here)
+      exitTileAction().catch(err => console.error("exitTileAction err (before-input-event)", err));
+   }
+  });
 
   // Helpful for dev debugging: open devtools if env var set
   if (process.env.SLAB_OPEN_DEVTOOLS === "1") {
@@ -238,6 +247,11 @@ function startRemoteServer() {
   const appServer = express();
   appServer.use(bodyParser.json());
   appServer.use(express.static(path.join(__dirname, "remote")));
+  
+  // if using the handler that parses messages into `data`
+  if (data.type === "command" && data.name === "exit_tile") {
+    exitTileAction().catch(err => console.error("exitTileAction err (remote)", err));
+  }
 
   // API endpoints
   appServer.post("/api/launch-slab", async (req, res) => {
@@ -365,15 +379,24 @@ ipcMain.handle("approve-remote", async (evt, token) => {
   return { ok: true };
 });
 
-ipcMain.handle("exit-tile", async () => {
+// extract exit logic into a function so we can call it from multiple places
+async function exitTileAction() {
   try {
-    // optional: attempt to kill commonly launched native apps when exiting tile
+    // optional: kill commonly launched native apps
     try { exec("pkill -f stremio"); } catch (e) {}
     try { exec("pkill -f vlc"); } catch (e) {}
     try { exec("pkill -f chrome"); } catch (e) {}
 
+    // ensure mainWindow exists
+    if (!mainWindow) return { ok: false, error: "no window" };
+
+    // try to restore dev UI if available, otherwise fallback to local index.html
     const up = await waitForUrl(DEV_URL, 2000, 200);
+    // ensure our window has focus so the UI is visible
+    try { mainWindow.focus(); } catch (e) {}
+
     mainWindow.setFullScreen(false);
+
     if (up) {
       await mainWindow.loadURL(DEV_URL);
     } else {
@@ -381,10 +404,16 @@ ipcMain.handle("exit-tile", async () => {
     }
     return { ok: true };
   } catch (err) {
-    console.error("exit-tile err", err);
+    console.error("exitTileAction err", err);
     return { ok: false, error: err.message };
   }
+}
+
+// keep the IPC handler but delegate to the action
+ipcMain.handle("exit-tile", async () => {
+  return await exitTileAction();
 });
+
 
 // -------------------- App lifecycle --------------------
 app.whenReady().then(async () => {
