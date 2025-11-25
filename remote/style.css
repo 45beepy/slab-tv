@@ -1,0 +1,41 @@
+/* remote/style.css - small, friendly UI */
+:root {
+  --bg: #071027;
+  --card: #0e1a2b;
+  --accent: #06b6d4;
+  --muted: #94a3b8;
+  --glass: rgba(255,255,255,0.02);
+}
+
+html,body {
+  margin: 0; padding: 0;
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+  background: linear-gradient(180deg,var(--bg), #020617);
+  color: #e6eef8;
+  min-height: 100vh;
+}
+
+#app { max-width: 760px; margin: 18px auto; padding: 12px; }
+
+header { display:flex; align-items:center; gap:12px; margin-bottom:14px; }
+header img { width:56px; height:56px; border-radius:8px; object-fit:cover; }
+header h1 { margin:0; font-size:20px; }
+#hostHint { margin-left:auto; color:var(--muted); font-size:13px; }
+
+.panel { background:var(--card); border-radius:12px; padding:12px; margin-bottom:12px; box-shadow:0 6px 24px rgba(2,6,23,0.6); }
+.row { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+input { flex:1; padding:10px 12px; border-radius:8px; background:var(--glass); color:inherit; border:1px solid rgba(255,255,255,0.03); }
+button { background:var(--accent); color:#012226; border:none; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:600; }
+button.secondary { background:#7c3aed; color:white; }
+
+.status { margin-top:6px; color:var(--muted); }
+
+.dpad { width:86px; height:46px; font-size:18px; background:#0b1220; color:#e6eef8; border-radius:8px; border:1px solid rgba(255,255,255,0.03); cursor:pointer; }
+#okBtn { width:86px; height:46px; background:var(--accent); color:#012226; font-weight:700; }
+.dpad-row { display:flex; justify-content:center; gap:8px; margin-bottom:8px; }
+.dpad-foot { display:flex; justify-content:center; margin-top:6px; }
+
+.appBtn { background:#0b1220; color:#e6eef8; border:1px solid rgba(255,255,255,0.04); padding:8px 12px; border-radius:8px; cursor:pointer; }
+#logs pre { max-height:160px; overflow:auto; color:#9fb0c8; background:transparent; margin:0; }
+
+footer { text-align:center; margin-top:8px; color:var(--muted); font-size:12px; }

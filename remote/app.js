@@ -1,155 +1,118 @@
 // remote/app.js
-// lightweight remote PWA client (vanilla JS) — uses WebSocket to the same host:port serving this file.
+// Lightweight remote controller UI that connects to ws://<host>:3000
+(() => {
+  const hostInput = document.getElementById('hostInput');
+  const connectBtn = document.getElementById('connectBtn');
+  const statusEl = document.getElementById('status');
+  const hostLabel = document.getElementById('hostLabel');
+  const pairBtn = document.getElementById('pairBtn');
+  const pairArea = document.getElementById('pairArea');
+  const pairQr = document.getElementById('pairQr');
+  const pairInfo = document.getElementById('pairInfo');
+  const logArea = document.getElementById('logArea');
 
-(function () {
-  const statusEl = document.getElementById("status");
-  const qrWrap = document.getElementById("qrWrap");
-  const reqPairBtn = document.getElementById("reqPair");
-  const dpad = document.getElementById("dpad");
-  const touchpad = document.getElementById("touchpad");
-  const textIn = document.getElementById("textIn");
-  const sendText = document.getElementById("sendText");
-  const tilesEl = document.getElementById("tiles");
-  const sendRaw = document.getElementById("sendRaw");
-  const rawCmd = document.getElementById("rawCmd");
-
-  // demo tiles (replace with dynamic fetch later)
-  const demoTiles = [
-    { id: "youtube", title: "YouTube", type: "web", url: "https://www.youtube.com/", icon: "/mnt/data/561eae9f-a058-4fc0-bc93-6c1f9c5ff7ba.png" },
-    { id: "stremio", title: "Stremio", type: "web", url: "https://www.stremio.com/", icon: "/mnt/data/561eae9f-a058-4fc0-bc93-6c1f9c5ff7ba.png" },
-    { id: "vlc", title: "VLC", type: "native", appId: "vlc", icon: "/mnt/data/561eae9f-a058-4fc0-bc93-6c1f9c5ff7ba.png" }
-  ];
-
-  // connect to same host:port serving the remote app (express serves remote at REMOTE_PORT)
-  const host = location.hostname;
-  const port = location.port || 3000; // remote server port
-  const wsUrl = `ws://${host}:${port}`;
+  // default host = same host served this page
+  const defaultHost = window.location.hostname || 'localhost';
+  const defaultPort = window.location.port || '3000';
+  hostLabel.textContent = `${defaultHost}:${defaultPort}`;
+  hostInput.value = `${defaultHost}:${defaultPort}`;
 
   let ws = null;
-  let connected = false;
-  let lastPair = null;
-
-  function setStatus(s) {
-    statusEl.textContent = s;
+  let wsUrl = null;
+  function log(...args) {
+    const line = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+    logArea.textContent = logArea.textContent + '\n' + line;
+    logArea.scrollTop = logArea.scrollHeight;
   }
 
-  function renderTiles() {
-    tilesEl.innerHTML = "";
-    demoTiles.forEach(t => {
-      const wrap = document.createElement("div");
-      wrap.className = "tile";
-      const img = document.createElement("img");
-      img.src = t.icon;
-      img.alt = t.title;
-      const title = document.createElement("div");
-      title.textContent = t.title;
-      title.style.marginTop = "6px";
-      title.style.fontSize = "13px";
-      wrap.appendChild(img);
-      wrap.appendChild(title);
-
-      wrap.addEventListener("click", async () => {
-        if (t.type === "web") {
-          ws.send(JSON.stringify({ type: "command", name: "open_url", url: t.url }));
-        } else if (t.type === "native") {
-          ws.send(JSON.stringify({ type: "command", name: "launch_app", appId: t.appId, args: [] }));
-        }
-      });
-
-      tilesEl.appendChild(wrap);
-    });
-  }
-
-  function connect() {
+  function connectToHost(hostAndPort) {
+    if (!hostAndPort) hostAndPort = `${defaultHost}:${defaultPort}`;
+    wsUrl = `ws://${hostAndPort}`;
     try {
-      ws = new WebSocket(wsUrl);
+      ws = new WebSocket(wsUrl.replace(/^http/, 'ws').replace(/^ws:\/\//,'ws://'));
     } catch (e) {
-      setStatus("ws connect failed");
-      console.error(e);
+      statusEl.textContent = `Conn error: ${e.message}`;
+      log('conn err', e);
       return;
     }
 
-    ws.addEventListener("open", () => {
-      connected = true;
-      setStatus("connected");
-      // request pair QR proactively
-      // not necessary, user can press "Request Pair"
-    });
-
-    ws.addEventListener("message", (ev) => {
-      try {
-        const data = JSON.parse(ev.data);
-        if (data.type === "pair") {
-          // server sends { type:"pair", token, qr }
-          lastPair = data.token;
-          qrWrap.innerHTML = `<img class="pair-qr" src="${data.qr}" alt="pair qr" />`;
-          setStatus("pair token ready");
-        } else {
-          console.log("ws message", data);
-        }
-      } catch (e) {
-        console.warn("invalid ws message", e);
+    statusEl.textContent = 'Connecting...';
+    ws.onopen = () => { statusEl.textContent = 'Connected'; log('ws open', wsUrl); };
+    ws.onclose = () => { statusEl.textContent = 'Disconnected'; log('ws close'); };
+    ws.onerror = (e) => { statusEl.textContent = 'Error'; log('ws error', e); };
+    ws.onmessage = (ev) => {
+      let data = null;
+      try { data = JSON.parse(ev.data); } catch (e) { log('invalid ws payload', ev.data); return; }
+      log('ws msg', data);
+      if (data.type === 'pair') {
+        pairArea.style.display = 'block';
+        pairQr.src = data.qr;
+        pairInfo.textContent = `Token: ${data.token} — Host: ${data.host}`;
       }
-    });
-
-    ws.addEventListener("close", () => {
-      connected = false;
-      setStatus("disconnected — retrying in 2s");
-      qrWrap.innerHTML = "";
-      setTimeout(connect, 2000);
-    });
-
-    ws.addEventListener("error", (e) => {
-      console.error("ws err", e);
-      setStatus("ws error");
-    });
+    };
   }
 
-  // controls
-  dpad.addEventListener("click", (ev) => {
-    const btn = ev.target.closest("button");
-    if (!btn) return;
-    const dir = btn.dataset.dir;
-    if (!dir || !connected) return;
-    ws.send(JSON.stringify({ type: "input", sub: "dpad", dir }));
-  });
+  connectBtn.onclick = () => {
+    if (ws) { ws.close(); ws = null; }
+    connectToHost(hostInput.value);
+  };
 
-  // touchpad (basic tap => click)
-  touchpad.addEventListener("click", (ev) => {
-    if (!connected) return;
-    // send mouse click
-    ws.send(JSON.stringify({ type: "input", sub: "mouse", action: "click" }));
-  });
-
-  // keyboard input
-  sendText.addEventListener("click", () => {
-    const t = textIn.value.trim();
-    if (!t || !connected) return;
-    ws.send(JSON.stringify({ type: "input", sub: "text", text: t }));
-    textIn.value = "";
-  });
-
-  // raw command sender
-  sendRaw.addEventListener("click", () => {
-    const txt = rawCmd.value.trim();
-    if (!txt) return alert("enter JSON");
-    try {
-      const obj = JSON.parse(txt);
-      ws.send(JSON.stringify(obj));
-    } catch (e) {
-      alert("invalid JSON");
+  // pairing
+  pairBtn.onclick = () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      alert('Connect first to request pairing.');
+      return;
     }
+    const req = { type: 'pair_request' };
+    ws.send(JSON.stringify(req));
+    log('pair_request sent');
+  };
+
+  // helpers to send dpad/input
+  function sendInput(obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { alert('Not connected'); return; }
+    ws.send(JSON.stringify(obj));
+    log('sent', obj);
+  }
+
+  // D-Pad
+  document.querySelectorAll('.dpad').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const dir = btn.dataset.dir || (btn.id === 'okBtn' ? 'ok' : null);
+      if (!dir) return;
+      sendInput({ type: 'input', sub: 'dpad', dir });
+    });
   });
 
-  // request pair
-  reqPairBtn.addEventListener("click", () => {
-    if (!connected) return alert("not connected");
-    ws.send(JSON.stringify({ type: "pair_request" }));
-    setStatus("requested pair — waiting for QR");
+  document.getElementById('backBtn').addEventListener('click', () => sendInput({ type: 'input', sub: 'dpad', dir: 'back' }));
+  document.getElementById('okBtn').addEventListener('click', () => sendInput({ type: 'input', sub: 'dpad', dir: 'ok' }));
+
+  // media
+  document.getElementById('playPause').addEventListener('click', () => {
+    // prefer MPRIS command route via WS
+    sendInput({ type: 'command', name: 'media', cmd: 'play-pause' });
+  });
+  document.getElementById('next').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'next' }));
+  document.getElementById('prev').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'prev' }));
+  document.getElementById('volUp').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'volume-up' }));
+  document.getElementById('volDown').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'volume-down' }));
+
+  // app launches
+  document.querySelectorAll('.appBtn').forEach(b => {
+    b.addEventListener('click', () => {
+      const appId = b.dataset.app;
+      sendInput({ type: 'command', name: 'launch_app', appId });
+    });
   });
 
-  // initial
-  renderTiles();
-  connect();
+  // open URL
+  document.getElementById('openUrlBtn').addEventListener('click', () => {
+    const url = document.getElementById('openUrlInput').value;
+    if (!url) return alert('Enter a URL');
+    sendInput({ type: 'command', name: 'open_url', url });
+  });
+
+  // auto connect by default
+  connectToHost(hostInput.value);
+  log('remote UI ready — ws target:', hostInput.value);
 })();
-
