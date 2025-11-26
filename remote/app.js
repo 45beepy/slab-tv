@@ -1,5 +1,4 @@
 // remote/app.js
-// Lightweight remote controller UI that connects to ws://<host>:3000
 (() => {
   const hostInput = document.getElementById('hostInput');
   const connectBtn = document.getElementById('connectBtn');
@@ -11,7 +10,6 @@
   const pairInfo = document.getElementById('pairInfo');
   const logArea = document.getElementById('logArea');
 
-  // default host = same host served this page
   const defaultHost = window.location.hostname || 'localhost';
   const defaultPort = window.location.port || '3000';
   hostLabel.textContent = `${defaultHost}:${defaultPort}`;
@@ -52,23 +50,15 @@
     };
   }
 
-  connectBtn.onclick = () => {
-    if (ws) { ws.close(); ws = null; }
-    connectToHost(hostInput.value);
-  };
+  connectBtn.onclick = () => { if (ws) { ws.close(); ws = null; } connectToHost(hostInput.value); };
 
-  // pairing
   pairBtn.onclick = () => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      alert('Connect first to request pairing.');
-      return;
-    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) { alert('Connect first to request pairing.'); return; }
     const req = { type: 'pair_request' };
     ws.send(JSON.stringify(req));
     log('pair_request sent');
   };
 
-  // helpers to send dpad/input
   function sendInput(obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) { alert('Not connected'); return; }
     ws.send(JSON.stringify(obj));
@@ -88,22 +78,14 @@
   document.getElementById('okBtn').addEventListener('click', () => sendInput({ type: 'input', sub: 'dpad', dir: 'ok' }));
 
   // media
-  document.getElementById('playPause').addEventListener('click', () => {
-    // prefer MPRIS command route via WS
-    sendInput({ type: 'command', name: 'media', cmd: 'play-pause' });
-  });
+  document.getElementById('playPause').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'play-pause' }));
   document.getElementById('next').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'next' }));
   document.getElementById('prev').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'prev' }));
   document.getElementById('volUp').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'volume-up' }));
   document.getElementById('volDown').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'volume-down' }));
 
   // app launches
-  document.querySelectorAll('.appBtn').forEach(b => {
-    b.addEventListener('click', () => {
-      const appId = b.dataset.app;
-      sendInput({ type: 'command', name: 'launch_app', appId });
-    });
-  });
+  document.querySelectorAll('.appBtn').forEach(b => b.addEventListener('click', () => { const appId = b.dataset.app; sendInput({ type: 'command', name: 'launch_app', appId }); }));
 
   // open URL
   document.getElementById('openUrlBtn').addEventListener('click', () => {
@@ -112,7 +94,42 @@
     sendInput({ type: 'command', name: 'open_url', url });
   });
 
-  // auto connect by default
+  // Trackpad
+  (function setupTouchpad(){
+    const pad = document.getElementById('pad');
+    if (!pad) return;
+    let lastX = null, lastY = null, dragging = false;
+    const THROTTLE_MS = 16;
+    let lastSend = 0;
+
+    function sendMove(dx, dy) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const msg = { type: 'input', sub: 'touch', dx, dy };
+      ws.send(JSON.stringify(msg));
+      log('touch', dx, dy);
+    }
+
+    pad.addEventListener('pointerdown', (e) => {
+      pad.setPointerCapture(e.pointerId);
+      lastX = e.clientX; lastY = e.clientY; dragging = true;
+    });
+
+    pad.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const now = Date.now();
+      if (now - lastSend < THROTTLE_MS) { lastX = e.clientX; lastY = e.clientY; return; }
+      const dx = e.clientX - lastX; const dy = e.clientY - lastY;
+      lastX = e.clientX; lastY = e.clientY; lastSend = now;
+      sendMove(Math.round(dx), Math.round(dy));
+    });
+
+    pad.addEventListener('pointerup', (e) => { try { pad.releasePointerCapture(e.pointerId); } catch (err) {} dragging = false; lastX = lastY = null; });
+
+    document.getElementById('padLeftClick').addEventListener('click', () => { if (!ws || ws.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({ type: 'input', sub: 'mouse', action: 'left' })); });
+    document.getElementById('padRightClick').addEventListener('click', () => { if (!ws || ws.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({ type: 'input', sub: 'mouse', action: 'right' })); });
+  })();
+
+  // auto connect
   connectToHost(hostInput.value);
   log('remote UI ready — ws target:', hostInput.value);
 })();

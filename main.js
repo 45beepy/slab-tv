@@ -1,6 +1,4 @@
-// main.js — patched for Flatpak Stremio, escape handling, robust remote WS parsing, dev URL retries
-// Paste this into your project (replace existing main.js). Requires nativeHelpers.js or will use stubs.
-
+// main.js — embed-web + MPRIS + X11 fallback + pointer/mouse handling + remote server
 const { app, BrowserWindow, ipcMain, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
@@ -13,127 +11,162 @@ const qrcode = require("qrcode");
 const bonjour = require("bonjour")();
 const os = require("os");
 
-// Config
 const REMOTE_PORT = process.env.SLAB_REMOTE_PORT ? parseInt(process.env.SLAB_REMOTE_PORT, 10) : 3000;
 const DEV_URL = process.env.DEV_URL || "http://localhost:5173";
 const CONFIG_PATH = path.join(app.getPath("userData") || __dirname, "slab-config.json");
-const DEFAULT_ICON = "/mnt/data/e964f202-19dc-4f76-8704-397525e1c456.png";
 
-// load nativeHelpers if present
+// try to load nativeHelpers if present
 let nativeHelpers = {};
-try {
-  nativeHelpers = require(path.join(__dirname, "nativeHelpers"));
-} catch (e) {
+try { nativeHelpers = require(path.join(__dirname, "nativeHelpers")); } catch (e) {
   console.warn("nativeHelpers not found — using stubs");
   nativeHelpers.detectDisplays = async () => [{ name: "Primary", geometry: "1920x1080+0+0" }];
   nativeHelpers.moveWindowToDisplay = async () => {};
   nativeHelpers.launchApp = (cmd, args = []) => {
-    try {
-      const c = spawn(cmd, args, { detached: true, stdio: 'ignore' });
-      c.unref();
-    } catch (err) {
-      console.error('launchApp stub failed', err);
-    }
+    try { const c = spawn(cmd, args, { detached: true, stdio: 'ignore' }); c.unref(); } catch (err) { console.error('launchApp stub failed', err); }
   };
 }
 
 let mainWindow = null;
 let wsServer = null;
 
+const ALLOW_X11_FALLBACK = process.env.ALLOW_X11_FALLBACK === "1";
+const PLAYERCTL_AVAILABLE = (() => { try { execSync("playerctl -v", { stdio: "ignore" }); return true; } catch (e) { return false; } })();
+
 function loadConfig() {
   try {
-    if (fs.existsSync(CONFIG_PATH)) return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    if (fs.existsSync(CONFIG_PATH)) return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
   } catch (e) {
-    console.error('loadConfig err', e);
+    console.error("loadConfig err", e);
   }
+  // sensible default config
   return {
-    securityMode: 'open',
+    securityMode: "open",
     pairedRemotes: [],
     neverShowHdmiPopup: false,
-    defaultApp: { appId: 'chrome', args: ['--new-window'], webUrl: 'https://www.youtube.com/' },
+    defaultApp: { appId: "chrome", args: ["--new-window"], webUrl: "https://www.youtube.com/" },
     apps: {
-      chrome: { type: 'web', webUrl: 'https://www.youtube.com/', title: 'Chrome' },
-      stremio: { type: 'native', appId: 'stremio', title: 'Stremio' },
-      vlc: { type: 'native', appId: 'vlc', title: 'VLC' }
+      chrome: { type: "web", webUrl: "https://www.youtube.com/", title: "YouTube (Chrome)", icon: "" },
+      stremio: { type: "native", appId: "stremio", title: "Stremio", icon: "" },
+      vlc: { type: "native", appId: "vlc", title: "VLC", icon: "" }
     }
   };
 }
 
 function saveConfig(cfg) {
-  try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8'); } catch (e) { console.error('saveConfig err', e); }
+  try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf8"); } catch (e) { console.error("saveConfig err", e); }
 }
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 720,
-    show: false,
-    backgroundColor: '#0f172a',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
+    width: 1280, height: 720, show: false, backgroundColor: "#0f172a",
+    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false }
   });
 
-  if (process.env.SLAB_OPEN_DEVTOOLS === '1') mainWindow.webContents.openDevTools({ mode: 'right' });
+  mainWindow.once("ready-to-show", () => { try { mainWindow.show(); } catch (e) { console.warn("show failed", e); } });
 
-  mainWindow.once('ready-to-show', () => { try { mainWindow.show(); } catch (e) { console.warn('show failed', e); } });
+  mainWindow.webContents.once("did-finish-load", () => console.log("Renderer finished loading:", mainWindow.webContents.getURL()));
 
-  mainWindow.webContents.once('did-finish-load', () => {
-    console.log('Renderer finished loading:', mainWindow.webContents.getURL());
-  });
-
-  mainWindow.webContents.on('did-fail-load', (e, code, desc, url) => {
-    console.error('did-fail-load', { code, desc, url });
-  });
-
-  mainWindow.webContents.on('render-process-gone', (e, details) => {
-    console.error('render-process-gone', details);
-  });
-
-  // catch Escape before page consumes it
-  mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input && input.type === 'keyDown' && input.key === 'Escape') {
+  mainWindow.webContents.on("before-input-event",(event,input)=>{
+    if (input && input.type === "keyDown" && input.key === "Escape") {
       event.preventDefault();
-      exitTileAction().catch(err => console.error('exitTileAction err', err));
+      exitTileAction().catch(err => console.error("exitTileAction err", err));
     }
   });
+
+  mainWindow.on("closed", () => { mainWindow = null; });
 }
 
-function waitForUrl(url, timeoutMs = 20000, intervalMs = 250) {
-  const start = Date.now();
-  return new Promise((resolve) => {
-    (function tryOnce() {
-      const req = http.request(url, { method: 'HEAD', timeout: 1500 }, (res) => resolve(true));
-      req.on('error', () => {
-        if (Date.now() - start > timeoutMs) return resolve(false);
-        setTimeout(tryOnce, intervalMs);
+// helper: is X11 session?
+function isX11Session() {
+  return String(process.env.XDG_SESSION_TYPE || "").toLowerCase() === "x11";
+}
+
+// X11 helpers (best-effort)
+function focusWindowByName(name) {
+  return new Promise(resolve => {
+    if (!ALLOW_X11_FALLBACK || !isX11Session()) return resolve(false);
+    exec(`xdotool search --name "${name}" | head -n1`, (err, stdout) => {
+      if (err || !stdout) return resolve(false);
+      const win = stdout.trim();
+      exec(`xdotool windowactivate ${win}`, (e2) => {
+        if (e2) return resolve(false);
+        setTimeout(() => resolve(true), 120);
       });
-      req.on('timeout', () => { req.destroy(); if (Date.now() - start > timeoutMs) return resolve(false); setTimeout(tryOnce, intervalMs); });
-      req.end();
-    })();
+    });
   });
 }
+function sendKeyWithXdotool(key) {
+  if (!ALLOW_X11_FALLBACK || !isX11Session()) return false;
+  try { spawn("xdotool", ["key", key]); return true; } catch (e) { console.warn("xdotool key failed", e); return false; }
+}
+function xdotoolMouseRelative(dx, dy) {
+  if (!ALLOW_X11_FALLBACK || !isX11Session()) return false;
+  try { spawn("xdotool", ["mousemove_relative", "--", String(dx), String(dy)]); return true; } catch (e) { return false; }
+}
+function xdotoolClick(which = "1") {
+  if (!ALLOW_X11_FALLBACK || !isX11Session()) return false;
+  try { spawn("xdotool", ["click", which]); return true; } catch (e) { return false; }
+}
 
-async function tryLoadDevUrlOrFallback(devUrl, fallbackFile, maxAttempts = 6, delayMs = 800) {
-  let attempt = 0;
-  while (attempt < maxAttempts) {
-    attempt++;
-    try {
-      console.log(`attempt ${attempt} loading ${devUrl} ...`);
-      await mainWindow.loadURL(devUrl);
-      console.log('Loaded dev url:', devUrl);
-      return true;
-    } catch (err) {
-      console.warn('loadURL failed', attempt, err && err.message ? err.message : err);
-      await new Promise(r => setTimeout(r, delayMs));
-      if (attempt === maxAttempts) {
-        try { await mainWindow.loadFile(fallbackFile); return true; } catch (e) { console.error('fallback load failed', e); return false; }
-      }
-    }
-  }
-  return false;
+// Wayland-ish fallback: try ydotool if installed
+function tryYdotool(argsArray) {
+  try { spawn("ydotool", argsArray, { stdio: "ignore" }); return true; } catch (e) { return false; }
+}
+
+// MPRIS helpers (playerctl)
+async function mediaPlayPause(player = null) {
+  if (!PLAYERCTL_AVAILABLE) return { ok: false, error: "playerctl not available" };
+  const args = player ? ["--player", player, "play-pause"] : ["play-pause"];
+  try { execSync(["playerctl", ...args].join(" "), { stdio: "ignore" }); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
+}
+async function mediaNext(player = null) {
+  if (!PLAYERCTL_AVAILABLE) return { ok: false, error: "playerctl not available" };
+  const args = player ? ["--player", player, "next"] : ["next"];
+  try { execSync(["playerctl", ...args].join(" "), { stdio: "ignore" }); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
+}
+async function mediaPrev(player = null) {
+  if (!PLAYERCTL_AVAILABLE) return { ok: false, error: "playerctl not available" };
+  const args = player ? ["--player", player, "previous"] : ["previous"];
+  try { execSync(["playerctl", ...args].join(" "), { stdio: "ignore" }); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
+}
+async function mediaVolume(delta = 0, player = null) {
+  if (!PLAYERCTL_AVAILABLE) return { ok: false, error: "playerctl not available" };
+  try {
+    let cur = execSync(["playerctl", ...(player ? ["--player", player] : []), "volume"].join(" "), { encoding: "utf8" }).trim();
+    cur = parseFloat(cur || "1.0");
+    let next = Math.min(1.0, Math.max(0.0, cur + delta));
+    execSync(["playerctl", ...(player ? ["--player", player] : []), "volume", String(next)].join(" "), { stdio: "ignore" });
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// open url inside main BrowserWindow (embed)
+async function doOpenUrlInView(url) {
+  if (!mainWindow) return { ok: false, error: "no window" };
+  try { await mainWindow.loadURL(url); try { mainWindow.setFullScreen(true); } catch(e){}; return { ok: true }; } catch (err) { console.error("doOpenUrlInView err", err); return { ok: false, error: err.message }; }
+}
+
+// launch native app (flatpak-aware for stremio); record lastLaunchedApp
+async function doLaunchApp(appId, args = []) {
+  try {
+    let cmd = null; let finalArgs = args || [];
+    if (appId === "chrome") { cmd = "google-chrome"; if (!finalArgs.length) finalArgs = ["--new-window"]; }
+    else if (appId === "vlc") { cmd = "vlc"; }
+    else if (appId === "stremio") {
+      try { execSync("flatpak run --version", { stdio: "ignore" }); cmd = "flatpak"; finalArgs = ["run", "com.stremio.Stremio", ...finalArgs]; } catch (e) { cmd = "stremio"; }
+    } else { cmd = appId; }
+    const child = spawn(cmd, finalArgs, { detached: true, stdio: "ignore" }); try { child.unref(); } catch(e){}
+    global.lastLaunchedApp = appId;
+    setTimeout(async () => {
+      try {
+        if (appId === "stremio") await focusWindowByName("Stremio");
+        if (appId === "vlc") await focusWindowByName("VLC");
+        if (appId === "chrome") await focusWindowByName("Google Chrome");
+      } catch (err) { console.warn("post-launch focus err", err); }
+    }, 900);
+    try { if (mainWindow) { mainWindow.setFullScreen(false); mainWindow.blur(); } } catch(e){}
+    return { ok: true };
+  } catch (e) { console.error("doLaunchApp err", e); return { ok: false, error: e.message }; }
 }
 
 async function doLaunchSlab() {
@@ -151,168 +184,148 @@ async function doLaunchSlab() {
     }
     mainWindow.setFullScreen(true);
     return { ok: true, display: null };
-  } catch (err) { console.error('doLaunchSlab err', err); return { ok: false, error: err.message }; }
-}
-
-async function doLaunchApp(appId, args = []) {
-  try {
-    let cmd = null; let finalArgs = args || [];
-
-    if (appId === 'chrome') { cmd = 'google-chrome'; if (!finalArgs.length) finalArgs = ['--new-window']; }
-    else if (appId === 'vlc') { cmd = 'vlc'; }
-    else if (appId === 'stremio') {
-      // prefer flatpak if available
-      try {
-        execSync('flatpak info --show-sdk com.stremio.Stremio', { stdio: 'ignore' });
-        cmd = 'flatpak'; finalArgs = ['run', 'com.stremio.Stremio', ...finalArgs];
-      } catch (e) {
-        // fallback
-        cmd = 'stremio';
-      }
-    } else { cmd = appId; }
-
-    const child = spawn(cmd, finalArgs, { detached: true, stdio: 'ignore' });
-    try { child.unref(); } catch (e) {}
-
-    try { if (mainWindow) { mainWindow.setFullScreen(false); mainWindow.blur(); } } catch (e) {}
-
-    setTimeout(async () => {
-      try {
-        const displays = await nativeHelpers.detectDisplays();
-        if (displays && displays.length > 1) {
-          if (appId === 'stremio') await nativeHelpers.moveWindowToDisplay('Stremio', displays[1]);
-          if (appId === 'chrome') await nativeHelpers.moveWindowToDisplay('Google Chrome', displays[1]);
-        }
-      } catch (err) { console.error('post-launch move err', err); }
-    }, 1200);
-
-    return { ok: true };
-  } catch (err) { console.error('doLaunchApp err', err); return { ok: false, error: err.message }; }
-}
-
-async function doOpenUrlInView(url) {
-  if (!mainWindow) return { ok: false, error: 'no window' };
-  try { await mainWindow.loadURL(url); mainWindow.setFullScreen(true); return { ok: true }; } catch (err) { console.error('doOpenUrlInView err', err); return { ok: false, error: err.message }; }
+  } catch (err) { console.error("doLaunchSlab err", err); return { ok: false, error: err.message }; }
 }
 
 async function exitTileAction() {
   try {
-    try { exec('pkill -f stremio'); } catch (e) {}
-    try { exec('pkill -f vlc'); } catch (e) {}
-    try { exec('pkill -f chrome'); } catch (e) {}
-
-    if (!mainWindow) return { ok: false, error: 'no window' };
-    const up = await waitForUrl(DEV_URL, 2000, 200);
-    try { mainWindow.focus(); } catch (e) {}
+    global.lastLaunchedApp = null;
+    if (!mainWindow) return { ok: false, error: "no window" };
+    const up = await (async (url, tm=2000, it=200) => {
+      const start = Date.now();
+      return new Promise(res => {
+        (function t(){ const req = http.request(url, { method: "HEAD", timeout: 1500 }, () => res(true)); req.on("error", ()=>{ if (Date.now()-start>tm) return res(false); setTimeout(t,it); }); req.on("timeout", ()=>{ req.destroy(); if (Date.now()-start>tm) return res(false); setTimeout(t,it); }); req.end(); })();
+      });
+    })(DEV_URL,2000,200);
+    try { mainWindow.focus(); } catch(e){}
     mainWindow.setFullScreen(false);
-    if (up) { await mainWindow.loadURL(DEV_URL); } else { await mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html')); }
+    if (up) await mainWindow.loadURL(DEV_URL); else await mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
     return { ok: true };
-  } catch (err) { console.error('exitTileAction err', err); return { ok: false, error: err.message }; }
+  } catch (err) { console.error("exitTileAction err", err); return { ok: false, error: err.message }; }
 }
 
+// Remote/WS server
 function startRemoteServer() {
   const appServer = express();
   appServer.use(bodyParser.json());
-  appServer.use(express.static(path.join(__dirname, 'remote')));
+  appServer.use(express.static(path.join(__dirname, "remote")));
 
-  appServer.post('/api/launch-slab', async (req, res) => res.json(await doLaunchSlab()));
-  appServer.post('/api/launch-app', async (req, res) => {
-    const body = req.body || {}; const cfg = loadConfig();
-    const appId = body.appId || (cfg.defaultApp || {}).appId || 'chrome';
-    const args = body.args || (cfg.defaultApp || {}).args || [];
+  appServer.post("/api/launch-slab", async (req, res) => res.json(await doLaunchSlab()));
+  appServer.post("/api/launch-app", async (req, res) => {
+    const body = req.body || {}; const appId = body.appId || (loadConfig().defaultApp || {}).appId || "chrome"; const args = body.args || (loadConfig().defaultApp || {}).args || [];
     res.json(await doLaunchApp(appId, args));
   });
-  appServer.get('/api/status', (req, res) => res.json({ ok: true, host: os.hostname() }));
+  appServer.get("/api/status", (req, res) => res.json({ ok: true, host: os.hostname() }));
+  appServer.post("/api/media/play-pause", async (req, res) => { const player = req.body?.player || null; res.json(await mediaPlayPause(player)); });
+  appServer.post("/api/media/next", async (req, res) => { const player = req.body?.player || null; res.json(await mediaNext(player)); });
+  appServer.post("/api/media/prev", async (req, res) => { const player = req.body?.player || null; res.json(await mediaPrev(player)); });
 
   const server = http.createServer(appServer);
   const wss = new WebSocket.Server({ server });
   wsServer = wss;
 
-  wss.on('connection', (socket) => {
-    console.log('Remote WS connected');
-    const cfg = loadConfig(); const mode = cfg.securityMode || 'open';
-    socket.isPaired = (mode === 'open');
-
-    socket.on('message', async (msg) => {
-      let data;
-      try { const txt = (typeof msg === 'string') ? msg : msg.toString(); data = JSON.parse(txt); } catch (err) { console.warn('WS: failed parse', err); return; }
+  wss.on("connection", socket => {
+    console.log("Remote WS connected");
+    socket.isPaired = true;
+    socket.on("message", async raw => {
+      let data; try { data = JSON.parse(typeof raw === "string" ? raw : raw.toString()); } catch (err) { console.warn("WS parse failed", err); return; }
       try {
-        if (mode === 'pairing' && !socket.isPaired) {
-          if (data.type === 'pair_request') {
-            const token = Math.random().toString(36).slice(2,8);
-            const hostString = `${os.hostname()}:${REMOTE_PORT}`;
-            const uri = `slabtv://pair?token=${token}&host=${hostString}`;
-            const qr = await qrcode.toDataURL(uri);
-            socket.pairToken = token;
-            socket.send(JSON.stringify({ type: 'pair', token, host: hostString, uri, qr }));
-            if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('pair-request', { token, host: hostString });
+        // pointer/touch events
+        if (data.type === "input" && data.sub === "touch") {
+          const dx = data.dx || 0, dy = data.dy || 0;
+          // forward to embedded web UI
+          if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("remote-pointer-delta", { dx, dy });
+          // fallback to native input
+          const last = global.lastLaunchedApp;
+          if (ALLOW_X11_FALLBACK && isX11Session()) { xdotoolMouseRelative(dx, dy); return; }
+          if (tryYdotool(["mousemove_relative", String(dx), String(dy)])) return;
+        } else if (data.type === "input" && data.sub === "mouse") {
+          if (data.action === "left") { if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("remote-mouse-click", { which: "left" }); if (ALLOW_X11_FALLBACK && isX11Session()) xdotoolClick("1"); else tryYdotool(["click", "1"]); }
+          if (data.action === "right") { if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("remote-mouse-click", { which: "right" }); if (ALLOW_X11_FALLBACK && isX11Session()) xdotoolClick("3"); else tryYdotool(["click", "3"]); }
+        } else if (data.type === "input" && data.sub === "dpad") {
+          const keyMap = { up: "Up", down: "Down", left: "Left", right: "Right", ok: "Return", back: "Escape" };
+          const key = keyMap[data.dir];
+          if (!key) return;
+          // media shortcuts via MPRIS for vlc
+          const last = global.lastLaunchedApp;
+          if (last === "vlc" && data.dir === "ok") { await mediaPlayPause("vlc"); return; }
+          // try focusing native app then send key via xdotool
+          if (ALLOW_X11_FALLBACK && isX11Session() && last) {
+            if (last === "stremio") await focusWindowByName("Stremio");
+            if (last === "vlc") await focusWindowByName("VLC");
+            if (last === "chrome") await focusWindowByName("Google Chrome");
+            const sent = sendKeyWithXdotool(key);
+            if (sent) return;
           }
-          return;
-        }
-
-        if (data.type === 'input' && data.sub === 'dpad') {
-          const keyMap = { up: 'Up', down: 'Down', left: 'Left', right: 'Right', ok: 'Return', back: 'Escape' };
-          if (keyMap[data.dir]) spawn('xdotool', ['key', keyMap[data.dir]]);
-        } else if (data.type === 'input' && data.sub === 'mouse') {
-          spawn('xdotool', ['click', '1']);
-        } else if (data.type === 'input' && data.sub === 'text') {
-          spawn('xdotool', ['type', data.text || '']);
-        } else if (data.type === 'command' && data.name === 'open_url') {
-          if (data.url) await doOpenUrlInView(data.url);
-        } else if (data.type === 'command' && data.name === 'launch_app') {
+          // otherwise forward as remote-input to renderer (for embedded web UI)
+          if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("remote-input", { key, raw: data });
+        } else if (data.type === "command" && data.name === "launch_app") {
           await doLaunchApp(data.appId, data.args || []);
-        } else if (data.type === 'command' && data.name === 'exit_tile') {
-          await exitTileAction();
+        } else if (data.type === "command" && data.name === "open_url") {
+          await doOpenUrlInView(data.url);
+        } else if (data.type === "command" && data.name === "media") {
+          const cmd = data.cmd;
+          if (cmd === "play-pause") await mediaPlayPause(data.player || null);
+          if (cmd === "next") await mediaNext(data.player || null);
+          if (cmd === "prev") await mediaPrev(data.player || null);
+        } else if (data.type === "pair_request") {
+          const token = Math.random().toString(36).slice(2,8);
+          const hostString = `${os.hostname()}:${REMOTE_PORT}`;
+          const uri = `slabtv://pair?token=${token}&host=${hostString}`;
+          const qr = await qrcode.toDataURL(uri);
+          socket.pairToken = token;
+          socket.send(JSON.stringify({ type: "pair", token, host: hostString, uri, qr }));
+          if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("pair-request", { token, host: hostString });
         } else {
-          console.log('WS: unknown message', data);
+          console.log("WS: unknown message", data);
         }
-      } catch (handlerErr) { console.error('WS handler err', handlerErr); }
+      } catch (handlerErr) { console.error("WS handler err", handlerErr); }
     });
 
-    socket.on('close', () => console.log('Remote WS disconnected'));
-    socket.on('error', (err) => console.error('Remote WS error', err));
+    socket.on("close", () => console.log("Remote WS disconnected"));
+    socket.on("error", (err) => console.error("Remote WS error", err));
   });
 
   server.listen(REMOTE_PORT, () => console.log(`Remote server listening at http://localhost:${REMOTE_PORT}`));
-  try { bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: 'slabtv', port: REMOTE_PORT }); } catch (e) { console.warn('bonjour publish failed', e); }
+  try { bonjour.publish({ name: `SlabTV-${os.hostname()}`, type: "slabtv", port: REMOTE_PORT }); } catch (e) { console.warn("bonjour publish failed", e); }
 }
 
 function startDisplayPolling(intervalMs = 1500) {
-  (async () => { try { const displays = await nativeHelpers.detectDisplays(); if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('displays-changed', displays); } catch (e) { console.error('initial display poll err', e); } })();
-  setInterval(async () => { try { const displays = await nativeHelpers.detectDisplays(); if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('displays-changed', displays); } catch (e) { console.error('display poll err', e); } }, intervalMs);
+  (async () => { try { const displays = await nativeHelpers.detectDisplays(); if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("displays-changed", displays); } catch (e) { console.error("initial display poll err", e); } })();
+  setInterval(async () => { try { const displays = await nativeHelpers.detectDisplays(); if (mainWindow && mainWindow.webContents) mainWindow.webContents.send("displays-changed", displays); } catch (e) { console.error("display poll err", e); } }, intervalMs);
 }
 
-ipcMain.handle('launch-slab', () => doLaunchSlab());
-ipcMain.handle('launch-app', (evt, appId, args) => doLaunchApp(appId, args));
-ipcMain.handle('open-url-in-view', (evt, url) => doOpenUrlInView(url));
-ipcMain.handle('get-config', () => loadConfig());
-ipcMain.handle('save-config', (evt, cfg) => { saveConfig(cfg); return { ok: true }; });
-ipcMain.handle('approve-remote', async (evt, token) => {
-  const cfg = loadConfig(); cfg.pairedRemotes = cfg.pairedRemotes || []; if (!cfg.pairedRemotes.includes(token)) { cfg.pairedRemotes.push(token); saveConfig(cfg); }
-  if (wsServer) wsServer.clients.forEach(c => { if (c.pairToken === token) c.isPaired = true; });
-  return { ok: true };
-});
-ipcMain.handle('exit-tile', async () => exitTileAction());
+// IPC
+ipcMain.handle("launch-slab", () => doLaunchSlab());
+ipcMain.handle("launch-app", (evt, appId, args) => doLaunchApp(appId, args));
+ipcMain.handle("open-url-in-view", (evt, url) => doOpenUrlInView(url));
+ipcMain.handle("get-config", () => loadConfig());
+ipcMain.handle("save-config", (evt, cfg) => { saveConfig(cfg); return { ok: true }; });
+ipcMain.handle("exit-tile", async () => exitTileAction());
+ipcMain.handle("media-play-pause", async (evt, player) => mediaPlayPause(player));
+ipcMain.handle("media-next", async (evt, player) => mediaNext(player));
+ipcMain.handle("media-prev", async (evt, player) => mediaPrev(player));
 
-process.on('unhandledRejection', (err) => console.error('unhandledRejection', err));
+process.on("unhandledRejection", (err) => console.error("unhandledRejection", err));
 
 app.whenReady().then(async () => {
   createWindow();
-  console.log('Preload path:', path.join(__dirname, 'preload.js'));
-  console.log('Renderer index path:', path.join(__dirname, 'renderer', 'index.html'));
-  console.log('Dev URL:', DEV_URL);
-
-  const fallback = path.join(__dirname, 'renderer', 'index.html');
+  const fallback = path.join(__dirname, "renderer", "index.html");
   try {
-    if (process.env.NODE_ENV !== 'production') {
-      const up = await waitForUrl(DEV_URL, 20000, 250);
-      if (up) await tryLoadDevUrlOrFallback(DEV_URL, fallback, 6, 800);
-      else { console.warn('Dev server not available — loading local index.html'); await mainWindow.loadFile(fallback); }
+    if (process.env.NODE_ENV !== "production") {
+      const up = await (async (url, tm=20000, it=250) => {
+        const start = Date.now();
+        return new Promise(res => {
+          (function t(){ const req = http.request(url, { method: "HEAD", timeout: 1500 }, ()=>res(true)); req.on("error", ()=>{ if (Date.now()-start>tm) return res(false); setTimeout(t,it); }); req.on("timeout", ()=>{ req.destroy(); if (Date.now()-start>tm) return res(false); setTimeout(t,it); }); req.end(); })();
+        });
+      })(DEV_URL,20000,250);
+      if (up) await (async function(){ let attempt=0; while(attempt<6){ attempt++; try{ console.log(`attempt ${attempt} loading ${DEV_URL} ...`); await mainWindow.loadURL(DEV_URL); console.log("Loaded dev url:", DEV_URL); return; } catch(e){ console.warn("loadURL failed", attempt, e && e.message ? e.message : e); await new Promise(r=>setTimeout(r,800)); if(attempt===6){ await mainWindow.loadFile(fallback); return; } } } })();
+      else { console.warn("Dev server not available — loading local index.html"); await mainWindow.loadFile(fallback); }
     } else { await mainWindow.loadFile(fallback); }
-  } catch (err) { console.error('Error during initial load', err); try { await mainWindow.loadFile(fallback); } catch (e) { console.error('Final fallback failure', e); } }
+  } catch (err) { console.error("Error during initial load", err); try { await mainWindow.loadFile(fallback); } catch (e) { console.error("Final fallback failure", e); } }
 
   startRemoteServer();
   startDisplayPolling();
 });
 
-app.on('window-all-closed', () => app.quit());
+app.on("window-all-closed", () => app.quit());
