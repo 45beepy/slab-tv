@@ -41,7 +41,6 @@
     ws.onmessage = (ev) => {
       let data = null;
       try { data = JSON.parse(ev.data); } catch (e) { log('invalid ws payload', ev.data); return; }
-      log('ws msg', data);
       if (data.type === 'pair') {
         pairArea.style.display = 'block';
         pairQr.src = data.qr;
@@ -53,83 +52,110 @@
   connectBtn.onclick = () => { if (ws) { ws.close(); ws = null; } connectToHost(hostInput.value); };
 
   pairBtn.onclick = () => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) { alert('Connect first to request pairing.'); return; }
-    const req = { type: 'pair_request' };
-    ws.send(JSON.stringify(req));
-    log('pair_request sent');
+    if (!ws || ws.readyState !== WebSocket.OPEN) { alert('Connect first.'); return; }
+    ws.send(JSON.stringify({ type: 'pair_request' }));
   };
 
   function sendInput(obj) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) { alert('Not connected'); return; }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify(obj));
-    log('sent', obj);
   }
 
-  // D-Pad
+  // --- UI BUTTONS ---
   document.querySelectorAll('.dpad').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault(); // Stop double-firing
       const dir = btn.dataset.dir || (btn.id === 'okBtn' ? 'ok' : null);
-      if (!dir) return;
-      sendInput({ type: 'input', sub: 'dpad', dir });
+      if (dir) sendInput({ type: 'input', sub: 'dpad', dir });
     });
   });
 
   document.getElementById('backBtn').addEventListener('click', () => sendInput({ type: 'input', sub: 'dpad', dir: 'back' }));
-  document.getElementById('okBtn').addEventListener('click', () => sendInput({ type: 'input', sub: 'dpad', dir: 'ok' }));
-
-  // media
-  document.getElementById('playPause').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'play-pause' }));
-  document.getElementById('next').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'next' }));
-  document.getElementById('prev').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'prev' }));
-  document.getElementById('volUp').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'volume-up' }));
-  document.getElementById('volDown').addEventListener('click', () => sendInput({ type: 'command', name: 'media', cmd: 'volume-down' }));
-
-  // app launches
-  document.querySelectorAll('.appBtn').forEach(b => b.addEventListener('click', () => { const appId = b.dataset.app; sendInput({ type: 'command', name: 'launch_app', appId }); }));
-
-  // open URL
-  document.getElementById('openUrlBtn').addEventListener('click', () => {
-    const url = document.getElementById('openUrlInput').value;
-    if (!url) return alert('Enter a URL');
-    sendInput({ type: 'command', name: 'open_url', url });
+  
+  // Media controls
+  ['playPause', 'next', 'prev', 'volUp', 'volDown'].forEach(id => {
+    const el = document.getElementById(id);
+    if(el) el.addEventListener('click', () => {
+      const cmdMap = { playPause:'play-pause', next:'next', prev:'prev', volUp:'volume-up', volDown:'volume-down' };
+      sendInput({ type: 'command', name: 'media', cmd: cmdMap[id] });
+    });
   });
 
-  // Trackpad
+  // App buttons
+  document.querySelectorAll('.appBtn').forEach(b => b.addEventListener('click', () => {
+    sendInput({ type: 'command', name: 'launch_app', appId: b.dataset.app });
+  }));
+
+  document.getElementById('openUrlBtn').addEventListener('click', () => {
+    const url = document.getElementById('openUrlInput').value;
+    if (url) sendInput({ type: 'command', name: 'open_url', url });
+  });
+
+  // --- TRACKPAD LOGIC (Tap to Click) ---
   (function setupTouchpad(){
     const pad = document.getElementById('pad');
     if (!pad) return;
-    let lastX = null, lastY = null, dragging = false;
+    
+    let lastX = null, lastY = null;
+    let isDragging = false;
+    let tapStartTime = 0;
+    let startX = 0, startY = 0;
+    const TAP_THRESHOLD_MS = 250; // Max time for a tap
+    const MOVE_THRESHOLD = 5; // Pixels to move before counting as a drag
     const THROTTLE_MS = 16;
     let lastSend = 0;
 
-    function sendMove(dx, dy) {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const msg = { type: 'input', sub: 'touch', dx, dy };
-      ws.send(JSON.stringify(msg));
-      log('touch', dx, dy);
-    }
-
     pad.addEventListener('pointerdown', (e) => {
       pad.setPointerCapture(e.pointerId);
-      lastX = e.clientX; lastY = e.clientY; dragging = true;
+      lastX = e.clientX; 
+      lastY = e.clientY;
+      startX = e.clientX; 
+      startY = e.clientY;
+      isDragging = false;
+      tapStartTime = Date.now();
     });
 
     pad.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
       const now = Date.now();
-      if (now - lastSend < THROTTLE_MS) { lastX = e.clientX; lastY = e.clientY; return; }
-      const dx = e.clientX - lastX; const dy = e.clientY - lastY;
-      lastX = e.clientX; lastY = e.clientY; lastSend = now;
-      sendMove(Math.round(dx), Math.round(dy));
+      
+      // Calculate total distance moved since start to detect "Tap vs Drag"
+      const totalDist = Math.hypot(e.clientX - startX, e.clientY - startY);
+      if (totalDist > MOVE_THRESHOLD) {
+        isDragging = true;
+      }
+
+      if (!isDragging) return; // Don't send moves if we are still deciding if it's a tap
+
+      if (now - lastSend < THROTTLE_MS) return;
+      
+      const dx = e.clientX - lastX; 
+      const dy = e.clientY - lastY;
+      lastX = e.clientX; 
+      lastY = e.clientY; 
+      lastSend = now;
+      
+      sendInput({ type: 'input', sub: 'touch', dx: Math.round(dx), dy: Math.round(dy) });
     });
 
-    pad.addEventListener('pointerup', (e) => { try { pad.releasePointerCapture(e.pointerId); } catch (err) {} dragging = false; lastX = lastY = null; });
+    pad.addEventListener('pointerup', (e) => {
+      try { pad.releasePointerCapture(e.pointerId); } catch (err) {}
+      
+      const duration = Date.now() - tapStartTime;
+      
+      // If we didn't drag much and time was short -> It's a TAP (Left Click)
+      if (!isDragging && duration < TAP_THRESHOLD_MS) {
+        log('Tap detected -> Click');
+        sendInput({ type: 'input', sub: 'mouse', action: 'left' });
+      }
+      
+      isDragging = false;
+      lastX = null; 
+      lastY = null;
+    });
 
-    document.getElementById('padLeftClick').addEventListener('click', () => { if (!ws || ws.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({ type: 'input', sub: 'mouse', action: 'left' })); });
-    document.getElementById('padRightClick').addEventListener('click', () => { if (!ws || ws.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({ type: 'input', sub: 'mouse', action: 'right' })); });
+    document.getElementById('padLeftClick').addEventListener('click', () => sendInput({ type: 'input', sub: 'mouse', action: 'left' }));
+    document.getElementById('padRightClick').addEventListener('click', () => sendInput({ type: 'input', sub: 'mouse', action: 'right' }));
   })();
 
-  // auto connect
   connectToHost(hostInput.value);
-  log('remote UI ready — ws target:', hostInput.value);
 })();
